@@ -1,4 +1,8 @@
 // scurve_profile.cpp - 7-phase S-curve velocity profile for stepper motors
+//
+// Supports asymmetric profiles with arbitrary boundary velocities (v_start, v_end)
+// for move blending. When v_start=0 and v_end=0 (default), produces the original
+// symmetric stop-to-stop profile.
 
 #include "scurve_profile.h"
 #include <math.h>
@@ -6,94 +10,105 @@
 SCurveProfile::SCurveProfile()
     : m_totalSteps(0)
     , m_maxVel(0)
-    , m_maxAccel(0)
     , m_jerk(0)
     , m_totalTime(0)
+    , m_accelRate(0)
+    , m_decelRate(0)
 {
     for (int i = 0; i < 7; i++) m_T[i] = 0;
     for (int i = 0; i < 8; i++) { m_B[i] = 0; m_V[i] = 0; }
 }
 
-// Compute distance covered during a single S-curve acceleration phase trio
-// (jerk-up + const-accel + jerk-down) given phase durations and jerk.
+// Compute distance covered during a single 3-phase acceleration ramp
+// (jerk-up + const-accel + jerk-down) starting from velocity = 0.
+// For a ramp starting at v_base, add v_base * (2*T1 + T2) to this result.
 static float accelPhaseDistance(float T1, float T2, float T3, float J) {
-    // Phase 1 (jerk up): d1 = J*T1^3/6
     float d1 = J * T1 * T1 * T1 / 6.0f;
-    // Velocity at end of phase 1:
     float v1 = J * T1 * T1 / 2.0f;
-    // Acceleration at end of phase 1:
     float a1 = J * T1;
-    // Phase 2 (const accel): d2 = v1*T2 + a1*T2^2/2
     float d2 = v1 * T2 + a1 * T2 * T2 / 2.0f;
-    // Velocity at end of phase 2:
     float v2 = v1 + a1 * T2;
-    // Phase 3 (jerk down): d3 = v2*T3 + a1*T3^2/2 - J*T3^3/6
     float d3 = v2 * T3 + a1 * T3 * T3 / 2.0f - J * T3 * T3 * T3 / 6.0f;
     return d1 + d2 + d3;
 }
 
-void SCurveProfile::plan(int32_t totalSteps, float maxVel, float maxAccel, float jerk) {
+// Compute T1 and T2 for a ramp that covers delta_v velocity change.
+static void computeRampParams(float delta_v, float maxAccel, float jerk,
+                               float& T1_out, float& T2_out) {
+    if (delta_v <= 0.0f) {
+        T1_out = 0.0f;
+        T2_out = 0.0f;
+        return;
+    }
+
+    float vJerkOnly = maxAccel * maxAccel / jerk;
+
+    if (vJerkOnly >= delta_v) {
+        T1_out = sqrtf(delta_v / jerk);
+        T2_out = 0.0f;
+    } else {
+        T1_out = maxAccel / jerk;
+        T2_out = (delta_v - vJerkOnly) / maxAccel;
+    }
+}
+
+// Distance for a ramp starting at v_base accelerating by delta_v.
+static float rampDistance(float v_base, float T1, float T2, float jerk) {
+    float T_total = 2.0f * T1 + T2;
+    return v_base * T_total + accelPhaseDistance(T1, T2, T1, jerk);
+}
+
+void SCurveProfile::plan(int32_t totalSteps, float maxVel, float maxAccel, float jerk,
+                          float v_start, float v_end) {
     m_totalSteps = totalSteps;
     m_jerk = jerk;
 
     if (totalSteps <= 0 || maxVel <= 0 || maxAccel <= 0 || jerk <= 0) {
         m_maxVel = 0;
-        m_maxAccel = 0;
+        m_accelRate = 0;
+        m_decelRate = 0;
         m_totalTime = 0;
         for (int i = 0; i < 7; i++) m_T[i] = 0;
         for (int i = 0; i < 8; i++) { m_B[i] = 0; m_V[i] = 0; }
         return;
     }
 
-    // Step 1: Compute jerk phase duration T1 = Amax / J
-    float T1 = maxAccel / jerk;
+    // Clamp boundary velocities
+    if (v_start < 0.0f) v_start = 0.0f;
+    if (v_end < 0.0f) v_end = 0.0f;
+    if (v_start > maxVel) v_start = maxVel;
+    if (v_end > maxVel) v_end = maxVel;
 
-    // Step 2: Compute velocity gained during jerk phases only (T2=0)
-    // During phases 1+3 (T1 each), velocity gain = J * T1^2 = Amax^2 / J
-    float vJerkOnly = jerk * T1 * T1;  // = Amax^2 / J
+    float achievedVmax = maxVel;
 
-    float achievedVmax;
-    float T2;
+    // Compute accel ramp params (v_start -> achievedVmax)
+    float T1a, T2a;
+    computeRampParams(achievedVmax - v_start, maxAccel, jerk, T1a, T2a);
+    float dAccel = rampDistance(v_start, T1a, T2a, jerk);
 
-    if (vJerkOnly >= maxVel) {
-        // Can't even reach Amax before hitting Vmax.
-        // Reduce T1 so that v = J*T1^2 = Vmax
-        T1 = sqrtf(maxVel / jerk);
-        T2 = 0;
-        achievedVmax = maxVel;
-    } else {
-        // T2 = time at constant Amax to reach Vmax
-        // Vmax = vJerkOnly + Amax * T2
-        T2 = (maxVel - vJerkOnly) / maxAccel;
-        achievedVmax = maxVel;
-    }
+    // Compute decel ramp params (achievedVmax -> v_end)
+    float T1d, T2d;
+    computeRampParams(achievedVmax - v_end, maxAccel, jerk, T1d, T2d);
+    float dDecel = rampDistance(v_end, T1d, T2d, jerk);
 
-    // Step 3: Compute distance needed for accel and decel phases
-    // Accel = phases 1,2,3 (T1, T2, T1). Decel = phases 5,6,7 (same durations).
-    float dAccel = accelPhaseDistance(T1, T2, T1, jerk);
-    float dTotal = dAccel * 2.0f;  // accel + decel (symmetric)
+    float dTotal = dAccel + dDecel;
 
     if (dTotal > (float)totalSteps) {
-        // Not enough distance for full speed. Reduce Vmax iteratively.
-        // Binary search for the achievable Vmax.
-        float vLo = MIN_VEL;
+        // Not enough distance for full speed. Binary search for achievable Vmax.
+        float vLo = v_start > v_end ? v_start : v_end;
+        if (vLo < MIN_VEL) vLo = MIN_VEL;
         float vHi = achievedVmax;
 
         for (int iter = 0; iter < 30; iter++) {
             float vMid = (vLo + vHi) / 2.0f;
 
-            // Recompute T1, T2 for this vMid
-            float t1, t2;
-            float vJerk = jerk * (maxAccel / jerk) * (maxAccel / jerk);  // Amax^2/J
-            if (vJerk >= vMid) {
-                t1 = sqrtf(vMid / jerk);
-                t2 = 0;
-            } else {
-                t1 = maxAccel / jerk;
-                t2 = (vMid - vJerk) / maxAccel;
-            }
+            float t1a_t, t2a_t, t1d_t, t2d_t;
+            computeRampParams(vMid - v_start, maxAccel, jerk, t1a_t, t2a_t);
+            computeRampParams(vMid - v_end, maxAccel, jerk, t1d_t, t2d_t);
 
-            float d = accelPhaseDistance(t1, t2, t1, jerk) * 2.0f;
+            float d = rampDistance(v_start, t1a_t, t2a_t, jerk)
+                    + rampDistance(v_end, t1d_t, t2d_t, jerk);
+
             if (d > (float)totalSteps) {
                 vHi = vMid;
             } else {
@@ -102,55 +117,74 @@ void SCurveProfile::plan(int32_t totalSteps, float maxVel, float maxAccel, float
         }
 
         achievedVmax = vLo;
-        // Recompute T1, T2 with final Vmax
-        float vJerk = jerk * (maxAccel / jerk) * (maxAccel / jerk);
-        if (vJerk >= achievedVmax) {
-            T1 = sqrtf(achievedVmax / jerk);
-            T2 = 0;
-        } else {
-            T1 = maxAccel / jerk;
-            T2 = (achievedVmax - vJerk) / maxAccel;
-        }
-        dAccel = accelPhaseDistance(T1, T2, T1, jerk);
+
+        // Recompute ramp params with final Vmax
+        computeRampParams(achievedVmax - v_start, maxAccel, jerk, T1a, T2a);
+        computeRampParams(achievedVmax - v_end, maxAccel, jerk, T1d, T2d);
+        dAccel = rampDistance(v_start, T1a, T2a, jerk);
+        dDecel = rampDistance(v_end, T1d, T2d, jerk);
     }
 
     m_maxVel = achievedVmax;
-    m_maxAccel = jerk * T1;  // achieved acceleration
+    m_accelRate = jerk * T1a;
+    m_decelRate = jerk * T1d;
 
-    // Step 4: Compute cruise phase duration
-    float dCruise = (float)totalSteps - 2.0f * dAccel;
+    // Cruise phase duration
+    float dCruise = (float)totalSteps - dAccel - dDecel;
     float T4 = (dCruise > 0 && achievedVmax > MIN_VEL) ? dCruise / achievedVmax : 0;
 
-    // Step 5: Assign phase durations (symmetric profile)
-    m_T[0] = T1;  // Phase 1: jerk up
-    m_T[1] = T2;  // Phase 2: const accel
-    m_T[2] = T1;  // Phase 3: jerk down
-    m_T[3] = T4;  // Phase 4: cruise
-    m_T[4] = T1;  // Phase 5: jerk down (decel start)
-    m_T[5] = T2;  // Phase 6: const decel
-    m_T[6] = T1;  // Phase 7: jerk up (decel end)
+    // Assign phase durations (asymmetric)
+    m_T[0] = T1a;  // Phase 1: jerk up (accel)
+    m_T[1] = T2a;  // Phase 2: const accel
+    m_T[2] = T1a;  // Phase 3: jerk down (accel)
+    m_T[3] = T4;   // Phase 4: cruise
+    m_T[4] = T1d;  // Phase 5: jerk down (decel start)
+    m_T[5] = T2d;  // Phase 6: const decel
+    m_T[6] = T1d;  // Phase 7: jerk up (decel end)
 
-    // Step 6: Compute boundary times
+    // Compute boundary times
     m_B[0] = 0;
     for (int i = 0; i < 7; i++) {
         m_B[i + 1] = m_B[i] + m_T[i];
     }
     m_totalTime = m_B[7];
 
-    // Step 7: Compute boundary velocities
-    m_V[0] = 0;                                          // start
-    m_V[1] = jerk * T1 * T1 / 2.0f;                     // end phase 1
-    m_V[2] = m_V[1] + m_maxAccel * T2;                   // end phase 2
-    m_V[3] = achievedVmax;                                // end phase 3 / start cruise
-    m_V[4] = achievedVmax;                                // end cruise
-    m_V[5] = achievedVmax - jerk * T1 * T1 / 2.0f;       // end phase 5
-    m_V[6] = m_V[5] - m_maxAccel * T2;                   // end phase 6
-    m_V[7] = 0;                                          // end (should be ~0)
+    // Compute boundary velocities
+    m_V[0] = v_start;
+    m_V[1] = v_start + jerk * T1a * T1a / 2.0f;
+    m_V[2] = m_V[1] + m_accelRate * T2a;
+    m_V[3] = achievedVmax;
+    m_V[4] = achievedVmax;
+    m_V[5] = achievedVmax - jerk * T1d * T1d / 2.0f;
+    m_V[6] = m_V[5] - m_decelRate * T2d;
+    m_V[7] = v_end;
+}
+
+void SCurveProfile::planPhysical(float phys_distance_mm,
+                                  float v_start_mmps, float v_nominal_mmps,
+                                  float v_end_mmps,
+                                  float a_max_mmps2, float j_max_mmps3,
+                                  float steps_per_mm) {
+    int32_t totalSteps = (int32_t)(phys_distance_mm * steps_per_mm + 0.5f);
+    float maxVel_sps   = v_nominal_mmps * steps_per_mm;
+    float maxAccel_sps = a_max_mmps2 * steps_per_mm;
+    float jerk_sps     = j_max_mmps3 * steps_per_mm;
+    float vs_sps       = v_start_mmps * steps_per_mm;
+    float ve_sps       = v_end_mmps * steps_per_mm;
+
+    plan(totalSteps, maxVel_sps, maxAccel_sps, jerk_sps, vs_sps, ve_sps);
+}
+
+uint32_t SCurveProfile::steps_to_stop(float v_current, float a_max, float steps_per_mm) {
+    if (v_current <= 0.0f || a_max <= 0.0f) return 0;
+    float d_mm = (v_current * v_current) / (2.0f * a_max);
+    uint32_t steps = (uint32_t)(d_mm * steps_per_mm + 1.0f);
+    return steps;
 }
 
 float SCurveProfile::velocityAt(float t) const {
     if (m_totalSteps <= 0 || t < 0) return 0;
-    if (t >= m_totalTime) return 0;
+    if (t >= m_totalTime) return m_V[7];
 
     // Find which phase we're in
     uint8_t ph = 6;
@@ -165,14 +199,14 @@ float SCurveProfile::velocityAt(float t) const {
     float v;
 
     switch (ph) {
-        case 0:  // Jerk up: v = J*dt^2/2
-            v = m_jerk * dt * dt / 2.0f;
+        case 0:  // Jerk up: v = V[0] + J*dt^2/2
+            v = m_V[0] + m_jerk * dt * dt / 2.0f;
             break;
-        case 1:  // Const accel: v = V1 + Amax*dt
-            v = m_V[1] + m_maxAccel * dt;
+        case 1:  // Const accel: v = V[1] + accelRate*dt
+            v = m_V[1] + m_accelRate * dt;
             break;
-        case 2:  // Jerk down: v = V2 + Amax*dt - J*dt^2/2
-            v = m_V[2] + m_maxAccel * dt - m_jerk * dt * dt / 2.0f;
+        case 2:  // Jerk down: v = V[2] + accelRate*dt - J*dt^2/2
+            v = m_V[2] + m_accelRate * dt - m_jerk * dt * dt / 2.0f;
             break;
         case 3:  // Cruise: v = Vmax
             v = m_V[3];
@@ -180,11 +214,11 @@ float SCurveProfile::velocityAt(float t) const {
         case 4:  // Jerk down (decel start): v = Vmax - J*dt^2/2
             v = m_V[4] - m_jerk * dt * dt / 2.0f;
             break;
-        case 5:  // Const decel: v = V5 - Amax*dt
-            v = m_V[5] - m_maxAccel * dt;
+        case 5:  // Const decel: v = V[5] - decelRate*dt
+            v = m_V[5] - m_decelRate * dt;
             break;
-        case 6:  // Jerk up (decel end): v = V6 - Amax*dt + J*dt^2/2
-            v = m_V[6] - m_maxAccel * dt + m_jerk * dt * dt / 2.0f;
+        case 6:  // Jerk up (decel end): v = V[6] - decelRate*dt + J*dt^2/2
+            v = m_V[6] - m_decelRate * dt + m_jerk * dt * dt / 2.0f;
             break;
         default:
             v = 0;
@@ -206,14 +240,14 @@ float SCurveProfile::distanceAt(float t) const {
         tRemain -= dt;
 
         switch (ph) {
-            case 0:  // Jerk up: d = J*dt^3/6
-                d += m_jerk * dt * dt * dt / 6.0f;
+            case 0:  // Jerk up: d = V[0]*dt + J*dt^3/6
+                d += m_V[0] * dt + m_jerk * dt * dt * dt / 6.0f;
                 break;
-            case 1:  // Const accel: d = V1*dt + Amax*dt^2/2
-                d += m_V[1] * dt + m_maxAccel * dt * dt / 2.0f;
+            case 1:  // Const accel: d = V[1]*dt + accelRate*dt^2/2
+                d += m_V[1] * dt + m_accelRate * dt * dt / 2.0f;
                 break;
-            case 2:  // Jerk down: d = V2*dt + Amax*dt^2/2 - J*dt^3/6
-                d += m_V[2] * dt + m_maxAccel * dt * dt / 2.0f - m_jerk * dt * dt * dt / 6.0f;
+            case 2:  // Jerk down: d = V[2]*dt + accelRate*dt^2/2 - J*dt^3/6
+                d += m_V[2] * dt + m_accelRate * dt * dt / 2.0f - m_jerk * dt * dt * dt / 6.0f;
                 break;
             case 3:  // Cruise: d = Vmax*dt
                 d += m_V[3] * dt;
@@ -221,11 +255,11 @@ float SCurveProfile::distanceAt(float t) const {
             case 4:  // Jerk down (decel): d = Vmax*dt - J*dt^3/6
                 d += m_V[4] * dt - m_jerk * dt * dt * dt / 6.0f;
                 break;
-            case 5:  // Const decel: d = V5*dt - Amax*dt^2/2
-                d += m_V[5] * dt - m_maxAccel * dt * dt / 2.0f;
+            case 5:  // Const decel: d = V[5]*dt - decelRate*dt^2/2
+                d += m_V[5] * dt - m_decelRate * dt * dt / 2.0f;
                 break;
-            case 6:  // Jerk up (decel end): d = V6*dt - Amax*dt^2/2 + J*dt^3/6
-                d += m_V[6] * dt - m_maxAccel * dt * dt / 2.0f + m_jerk * dt * dt * dt / 6.0f;
+            case 6:  // Jerk up (decel end): d = V[6]*dt - decelRate*dt^2/2 + J*dt^3/6
+                d += m_V[6] * dt - m_decelRate * dt * dt / 2.0f + m_jerk * dt * dt * dt / 6.0f;
                 break;
         }
     }
@@ -281,7 +315,6 @@ int32_t SCurveProfile::computeIntervalBlock(int32_t startStep, uint16_t* lut, in
     int32_t toCompute = count;
     if (startStep + toCompute > m_totalSteps) toCompute = m_totalSteps - startStep;
 
-    // Get time at starting step: t=0 for step 0, binary search otherwise
     float t = (startStep == 0) ? 0.0f : timeAtStep(startStep);
     float fTickFreq = (float)tickFreq;
 
@@ -294,7 +327,6 @@ int32_t SCurveProfile::computeIntervalBlock(int32_t startStep, uint16_t* lut, in
         else if (interval < 1.0f) lut[i] = 1;
         else lut[i] = (uint16_t)(interval + 0.5f);
 
-        // Advance time by one step (dt = 1/velocity)
         t += 1.0f / v;
     }
     return toCompute;

@@ -15,6 +15,9 @@
 // Short moves degrade gracefully: T4=0 (no cruise), T2=T6=0 (triangular),
 // or reduced Vmax/Amax for very short moves.
 //
+// Supports arbitrary boundary velocities (v_start, v_end) for move blending.
+// Default v_start=0, v_end=0 preserves original stop-to-stop behavior.
+//
 // On AVR, the profile is pre-computed into a lookup table (LUT) of timer
 // intervals so the ISR performs only a single array read per step.
 
@@ -27,12 +30,31 @@ class SCurveProfile {
 public:
     SCurveProfile();
 
-    // Plan a move profile.
+    // Plan a move profile with optional boundary velocities.
     // totalSteps: number of steps for the dominant axis (always positive)
     // maxVel:     maximum velocity (steps/sec)
     // maxAccel:   maximum acceleration (steps/sec^2)
     // jerk:       maximum jerk (steps/sec^3)
-    void plan(int32_t totalSteps, float maxVel, float maxAccel, float jerk);
+    // v_start:    velocity at move start (steps/sec, default 0)
+    // v_end:      velocity at move end (steps/sec, default 0)
+    void plan(int32_t totalSteps, float maxVel, float maxAccel, float jerk,
+              float v_start = 0.0f, float v_end = 0.0f);
+
+    // Plan in physical units, then convert to step-space internally.
+    // phys_distance_mm: physical distance of the move [mm]
+    // v_start_mmps:     entry velocity [mm/s]
+    // v_nominal_mmps:   target cruise velocity [mm/s]
+    // v_end_mmps:       exit velocity [mm/s]
+    // a_max_mmps2:      max acceleration [mm/s^2]
+    // j_max_mmps3:      max jerk [mm/s^3]
+    // steps_per_mm:     step rate for dominant axis [steps/mm]
+    void planPhysical(float phys_distance_mm,
+                      float v_start_mmps, float v_nominal_mmps, float v_end_mmps,
+                      float a_max_mmps2, float j_max_mmps3,
+                      float steps_per_mm);
+
+    // Emergency: steps needed to decelerate from v to 0 (trapezoidal, not S-curve).
+    static uint32_t steps_to_stop(float v_current, float a_max, float steps_per_mm);
 
     // Get velocity at a given time (seconds from move start).
     // Returns velocity in steps/sec.
@@ -72,6 +94,11 @@ public:
     float phaseDuration(uint8_t phase) const;  // phase 0-6
     float phaseStartTime(uint8_t phase) const; // cumulative start time
 
+    // Boundary velocities (for testing)
+    float startVelocity() const { return m_V[0]; }
+    float endVelocity() const { return m_V[7]; }
+    float peakVelocity() const { return m_maxVel; }
+
 private:
     // Convert step index to time using velocity integration
     float timeAtStep(int32_t stepIndex) const;
@@ -81,16 +108,19 @@ private:
 
     int32_t m_totalSteps;
     float   m_maxVel;      // achieved max velocity (may be less than requested)
-    float   m_maxAccel;    // achieved max acceleration (may be less than requested)
     float   m_jerk;
     float   m_totalTime;
+
+    // Achieved acceleration for accel and decel ramps (may differ in asymmetric profiles)
+    float   m_accelRate;   // J * T1_accel: achieved acceleration during phases 0-2
+    float   m_decelRate;   // J * T1_decel: achieved acceleration during phases 4-6
 
     // Phase durations T[0..6] and cumulative boundary times B[0..7]
     float   m_T[7];        // duration of each phase
     float   m_B[8];        // cumulative time at start of each phase; B[7] = total time
 
     // Velocity at phase boundaries V[0..7]
-    float   m_V[8];        // V[0]=0 (start), V[3]=Vmax (cruise start), V[7]=0 (end)
+    float   m_V[8];        // V[0]=v_start, V[3]=Vmax (cruise start), V[7]=v_end
 
     // Minimum velocity to prevent division by zero (steps/sec)
     static constexpr float MIN_VEL = 1.0f;
