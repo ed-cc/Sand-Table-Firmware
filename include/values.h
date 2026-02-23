@@ -67,11 +67,30 @@
 #define RADIUS_STEPS_PER_MM ((STEPS_PER_REV * MICROSTEPS * RADIUS_DRIVE_RATIO) / (BELT_PULLEY_TEETH * BELT_PITCH_MM))
 // = (200 * 16 * 1.25) / (16 * 2) = 125 steps/mm
 
-// Radius compensation for theta motion (due to mechanical linkage)
-// When theta rotates, radius motor must compensate to maintain constant radius
-// Formula: (STEPS_PER_REV * MICROSTEPS * (RADIUS_CENTRE_PULLEY_TEETH / RADIUS_MOTOR_TEETH)) / 360
-#define RADIUS_STEPS_PER_THETA_DEGREE ((STEPS_PER_REV * MICROSTEPS * (RADIUS_CENTRE_PULLEY_TEETH / (float)RADIUS_MOTOR_TEETH)) / 360.0f)
-// = (200 * 16 * (100/16)) / 360 = 55.556 steps/degree
+// Radius compensation for theta motion (reference frame translation)
+//
+// MECHANICAL CONSTRAINT: The 100T center pulley must rotate at the same angular
+// velocity as the 210T theta output to prevent belt wind-up in the rotating reference frame.
+//
+// When theta motor moves 210 steps:
+//   - Theta output (210T) rotates by: 210 * (16/210) = 16 teeth worth
+//   - Radius compensation must rotate 100T center pulley by the same angle
+//   - Required radius motor movement: 100 steps
+//   - Compensation ratio: 100/210 = 0.47619 (or 10/21)
+//
+// Calculation breakdown:
+//   - Theta motor drives 210T output at ratio: 210/16 = 13.125
+//   - Radius motor drives 100T center via 16:20 intermediate: effective ratio for 100T rotation
+//   - RADIUS_CENTRE_DRIVE_RATIO represents the effective ratio to rotate the 100T pulley
+//   - Compensation per theta step: (100/210) = RADIUS_CENTRE_DRIVE_RATIO / THETA_DRIVE_RATIO
+//
+#define RADIUS_CENTRE_DRIVE_RATIO (RADIUS_CENTRE_PULLEY_TEETH / (float)RADIUS_MOTOR_TEETH)  // = 100/16 = 6.25
+#define RADIUS_COMPENSATION_PER_THETA_STEP (RADIUS_CENTRE_DRIVE_RATIO / THETA_DRIVE_RATIO)
+// = 6.25 / 13.125 = 0.47619 = 100/210 (verified: 210 theta steps → 100 radius comp steps)
+
+// Radius motor steps per degree of centre pulley rotation
+#define RADIUS_CENTRE_STEPS_PER_DEGREE ((STEPS_PER_REV * MICROSTEPS * RADIUS_CENTRE_DRIVE_RATIO) / 360.0f)
+// = (200 * 16 * 6.25) / 360 = 55.556 steps/degree
 
 // Theta axis steps per degree (includes drive ratio)
 // Formula: (STEPS_PER_REV * MICROSTEPS * THETA_DRIVE_RATIO) / 360
@@ -80,8 +99,8 @@
 
 // ===== Motion Limits =====
 // Maximum travel limits (in user units)
-#define RADIUS_MIN_MM -200.0f
-#define RADIUS_MAX_MM 300.0f  // Adjust for your table radius
+#define RADIUS_MIN_MM -290.0f
+#define RADIUS_MAX_MM 290.0f
 
 #define THETA_MIN_DEGREES 0.0f
 #define THETA_MAX_DEGREES 360.0f
@@ -93,11 +112,24 @@
 // ===== Speed and Acceleration =====
 // Maximum speeds (steps/second)
 #define THETA_MAX_SPEED 2000    // Theta can typically move faster
-#define RADIUS_MAX_SPEED ((THETA_MAX_SPEED * RADIUS_STEPS_PER_THETA_DEGREE) / THETA_STEPS_PER_DEGREE)   // Adjust based on testing
+#define RADIUS_MAX_SPEED 20000   // Adjust based on testing
 
 // Acceleration (steps/second²)
-#define THETA_ACCELERATION 1500   // Theta can typically accelerate faster
-#define RADIUS_ACCELERATION ((THETA_ACCELERATION * RADIUS_STEPS_PER_THETA_DEGREE) / THETA_STEPS_PER_DEGREE)  // Smooth acceleration for radius
+#define THETA_ACCELERATION 1500   // Scaled to match speed (reaches max in ~1.3s)
+#define RADIUS_ACCELERATION 10000  // Scaled to match speed (reaches max in ~1.3s)
+
+// Jerk limits (steps/sec³) - rate of change of acceleration
+// jerk = acceleration * 10 means ~0.1s to reach max accel
+#define RADIUS_JERK 100000.0f   // steps/sec³
+#define THETA_JERK 15000.0f     // steps/sec³
+
+// Physical-unit convenience macros (for CoordinatedStepper API)
+#define RADIUS_MAX_SPEED_MM_S   (RADIUS_MAX_SPEED / RADIUS_STEPS_PER_MM)
+#define RADIUS_ACCEL_MM_S2      (RADIUS_ACCELERATION / RADIUS_STEPS_PER_MM)
+#define RADIUS_JERK_MM_S3       (RADIUS_JERK / RADIUS_STEPS_PER_MM)
+#define THETA_MAX_SPEED_DEG_S   (THETA_MAX_SPEED / THETA_STEPS_PER_DEGREE)
+#define THETA_ACCEL_DEG_S2      (THETA_ACCELERATION / THETA_STEPS_PER_DEGREE)
+#define THETA_JERK_DEG_S3       (THETA_JERK / THETA_STEPS_PER_DEGREE)
 
 // ===== UART Configuration =====
 #define TMC_UART_BAUD 57600  // Standard baudrate for TMC2208

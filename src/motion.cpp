@@ -1,372 +1,251 @@
-// motion.cpp - Motion control implementation for Sand Table
+// motion.cpp - Motion control wrapper implementation
+//
+// Wires TMC2208 UART driver configuration, CoordinatedStepper, TimerBackend,
+// and HomingManager into the Motion public API consumed by MotionCommander.
+
 #include "motion.h"
+#include "timer_backend.h"
+#include "values.h"
+#include <math.h>
+
+// TMC2208 drivers on hardware serial ports
+// Radius: Serial3 (TX=14, RX=15)
+// Theta:  Serial1 (TX=18, RX=19)
+static TMC2208Stepper s_radiusDriver(&Serial3, R_SENSE);
+static TMC2208Stepper s_thetaDriver(&Serial1, R_SENSE);
 
 Motion::Motion()
-    : radiusDriver(&Serial3, R_SENSE),
-      thetaDriver(&Serial1, R_SENSE),
-      radiusStepper(AccelStepper::DRIVER, RADIUS_STEP_PIN, RADIUS_DIR_PIN),
-      thetaStepper(AccelStepper::DRIVER, THETA_STEP_PIN, THETA_DIR_PIN),
-      m_isHoming(false),
-      m_isHomingTheta(false),
-      m_isHomingRadius(false),
-      m_motorsEnabled(false)
+    : m_radiusDriver(&s_radiusDriver)
+    , m_thetaDriver(&s_thetaDriver)
+    , m_isHoming(false)
+    , m_positionKnown(false)
+    , m_feedrate(1000.0f)  // Default 1000 mm/min
 {
 }
 
-void Motion::setupSteppers()
-{
-    Serial.println(F("\nInitializing motion control system..."));
-    Serial.println(F("======================================"));
+void Motion::setupSteppers() {
+    // Initialise TMC2208 UART communication
+    Serial3.begin(TMC_UART_BAUD);
+    Serial1.begin(TMC_UART_BAUD);
 
-    // Initialize endstop pins
-    pinMode(RADIUS_ENDSTOP_PIN, RADIUS_ENDSTOP_PULLUP ? INPUT_PULLUP : INPUT);
-    pinMode(THETA_ENDSTOP_PIN, THETA_ENDSTOP_PULLUP ? INPUT_PULLUP : INPUT);
-    Serial.println(F("✓ Endstop pins initialized"));
+    // Configure radius driver
+    m_radiusDriver->begin();
+    m_radiusDriver->pdn_disable(true);      // Use PDN pin for UART, not power-down
+    m_radiusDriver->I_scale_analog(false);   // Current set by registers, not VREF pin
+    m_radiusDriver->rms_current(RADIUS_MOTOR_CURRENT);
+    m_radiusDriver->ihold(8);               // ~25% hold current
+    m_radiusDriver->iholddelay(8);           // Smooth ramp transition
+    m_radiusDriver->TPOWERDOWN(20);          // ~0.5s before hold current engages
+    m_radiusDriver->microsteps(MICROSTEPS);
+    m_radiusDriver->en_spreadCycle(RADIUS_SPREAD_CYCLE);
+    m_radiusDriver->toff(3);                 // Enable driver output stage
 
-    // Initialize motor enable pins (CRITICAL - was missing!)
-    pinMode(RADIUS_EN_PIN, OUTPUT);
-    pinMode(THETA_EN_PIN, OUTPUT);
-    Serial.println(F("✓ Enable pins initialized"));
+    // Configure theta driver
+    m_thetaDriver->begin();
+    m_thetaDriver->pdn_disable(true);
+    m_thetaDriver->I_scale_analog(false);
+    m_thetaDriver->rms_current(THETA_MOTOR_CURRENT);
+    m_thetaDriver->ihold(6);                // ~20% hold current (less gravity load)
+    m_thetaDriver->iholddelay(8);
+    m_thetaDriver->TPOWERDOWN(40);           // ~1s delay before hold
+    m_thetaDriver->microsteps(MICROSTEPS);
+    m_thetaDriver->en_spreadCycle(THETA_SPREAD_CYCLE);
+    m_thetaDriver->toff(3);
 
-    // Initialize hardware serial ports for TMC drivers
-    Serial1.begin(TMC_UART_BAUD);  // Theta motor (pins 18 TX, 19 RX)
-    Serial3.begin(TMC_UART_BAUD);  // Radius motor (pins 14 TX, 15 RX)
-    disableMotors(); // Disable during setup
+    // Initialise stepper axes (pin configuration, port register resolution)
+    m_stepper.init();
 
-    delay(100); // Allow drivers to power up
+    // Initialise hardware timers
+    timerBackendInit();
 
-    // Configure TMC2208 drivers
-    Serial.println(F("Configuring TMC2208 drivers..."));
-    setupTMCDrivers();
+    // Start with motors disabled
+    disableMotors();
 
-    // Test communication
-    Serial.println(F("\nTesting driver communication..."));
-    if (testDriverCommunication())
-    {
-        Serial.println(F("✓ Driver communication successful!"));
-    }
-    else
-    {
-        Serial.println(F("✗ Warning: Driver communication issues detected"));
-        Serial.println(F("  Check wiring and R_SENSE value in values.h"));
-    }
+    Serial.println(F("Motion: TMC2208 drivers configured"));
+    Serial.print(F("Motion: Radius "));
+    Serial.print(RADIUS_MOTOR_CURRENT);
+    Serial.print(F("mA, Theta "));
+    Serial.print(THETA_MOTOR_CURRENT);
+    Serial.println(F("mA"));
+}
 
-    // Configure AccelStepper
-    Serial.println(F("\nConfiguring motion parameters..."));
+void Motion::home() {
+    Serial.println(F("[MOT] home() starting"));
+    m_isHoming = true;
+    enableMotors();
+    m_homingManager.start(m_stepper);
+}
 
-    // Radius motor
-    radiusStepper.setMaxSpeed(RADIUS_MAX_SPEED);
-    radiusStepper.setAcceleration(RADIUS_ACCELERATION);
-    radiusStepper.setCurrentPosition(0);
-
-    // Theta motor
-    thetaStepper.setMaxSpeed(THETA_MAX_SPEED);
-    thetaStepper.setAcceleration(THETA_ACCELERATION);
-    thetaStepper.setCurrentPosition(0);
-
-    // Enable drivers
+void Motion::moveTo(float radiusMM, float thetaDegrees) {
+    // Ensure motors are enabled before moving
     enableMotors();
 
-    printDriverStatus();
+    // Clamp to position limits
+    if (radiusMM < RADIUS_MIN_MM) radiusMM = RADIUS_MIN_MM;
+    if (radiusMM > RADIUS_MAX_MM) radiusMM = RADIUS_MAX_MM;
 
-    Serial.println(F("\n======================================"));
-    Serial.println(F("Motion system initialized!"));
-    Serial.println(F("======================================\n"));
+    Serial.print(F("[MOT] moveTo R="));
+    Serial.print(radiusMM, 2);
+    Serial.print(F(" A="));
+    Serial.print(thetaDegrees, 2);
+    Serial.print(F(" F="));
+    Serial.print(m_feedrate, 1);
+    Serial.print(F(" curR="));
+    Serial.print(getRadiusMM(), 2);
+    Serial.print(F(" curA="));
+    Serial.println(getThetaDegrees(), 2);
+
+    m_stepper.moveTo(radiusMM, thetaDegrees, m_feedrate);
+
+    Serial.print(F("[MOT] after plan: complete="));
+    Serial.print(m_stepper.isComplete() ? F("Y") : F("N"));
+    Serial.print(F(" profSteps="));
+    Serial.print(m_stepper.profile().totalSteps());
+    Serial.print(F(" profTime="));
+    Serial.println(m_stepper.profile().totalTime(), 4);
+
+    timerBackendStartMove(m_stepper);
 }
 
-void Motion::home()
-{
-    Serial.println(F("Homing to (0mm, 0°)..."));
-    homeTheta();
-    m_isHoming = true;
+void Motion::moveRelative(float radiusMM, float thetaDegrees) {
+    // Ensure motors are enabled before moving
+    enableMotors();
+
+    // Compute absolute target and clamp
+    float targetR = getRadiusMM() + radiusMM;
+    if (targetR < RADIUS_MIN_MM) targetR = RADIUS_MIN_MM;
+    if (targetR > RADIUS_MAX_MM) targetR = RADIUS_MAX_MM;
+
+    float deltaR = targetR - getRadiusMM();
+
+    Serial.print(F("[MOT] moveRel dR="));
+    Serial.print(deltaR, 2);
+    Serial.print(F(" dA="));
+    Serial.print(thetaDegrees, 2);
+    Serial.print(F(" F="));
+    Serial.print(m_feedrate, 1);
+    Serial.print(F(" curR="));
+    Serial.print(getRadiusMM(), 2);
+    Serial.print(F(" curA="));
+    Serial.println(getThetaDegrees(), 2);
+
+    m_stepper.moveRelative(deltaR, thetaDegrees, m_feedrate);
+
+    Serial.print(F("[MOT] after plan: complete="));
+    Serial.print(m_stepper.isComplete() ? F("Y") : F("N"));
+    Serial.print(F(" profSteps="));
+    Serial.print(m_stepper.profile().totalSteps());
+    Serial.print(F(" profTime="));
+    Serial.println(m_stepper.profile().totalTime(), 4);
+
+    timerBackendStartMove(m_stepper);
 }
 
-void Motion::moveTo(float radiusMM, float thetaDegrees)
-{
-    long radiusSteps = radiusMMToSteps(radiusMM);
-    long thetaSteps = thetaDegreesToSteps(thetaDegrees);
+void Motion::run() {
+    // Homing state machine
+    if (m_isHoming) {
+        // During homing, stepTick is called from main loop (no timer ISR for homing moves)
+        m_stepper.stepTick();
 
-    // Calculate radius compensation for theta position (mechanical linkage)
-    long radiusCompensation = calculateRadiusCompensation(thetaDegrees);
-
-    // Set motor positions (radius includes compensation for theta)
-    radiusStepper.moveTo(radiusSteps + radiusCompensation);
-    thetaStepper.moveTo(thetaSteps);
-
-    Serial.print(F("Moving to: R="));
-    Serial.print(radiusMM);
-    Serial.print(F("mm, Θ="));
-    Serial.print(thetaDegrees);
-    Serial.println(F("°"));
-}
-
-void Motion::moveRelative(float radiusMM, float thetaDegrees)
-{
-    long radiusSteps = radiusMMToSteps(radiusMM);
-    long thetaSteps = thetaDegreesToSteps(thetaDegrees);
-
-    // Calculate radius compensation for the theta change (mechanical linkage)
-    long radiusCompensation = calculateRadiusCompensation(thetaDegrees);
-
-    // Move motors (radius includes compensation for theta change)
-    radiusStepper.move(radiusSteps + radiusCompensation);
-    thetaStepper.move(thetaSteps);
-
-    Serial.print(F("Moving relative: ΔR="));
-    Serial.print(radiusMM);
-    Serial.print(F("mm, ΔΘ="));
-    Serial.print(thetaDegrees);
-    Serial.println(F("°"));
-}
-
-void Motion::run()
-{
-    checkEndstops();
-    radiusStepper.run();
-    thetaStepper.run();
-}
-
-bool Motion::isMovementComplete()
-{
-    return !radiusStepper.isRunning() && !thetaStepper.isRunning();
-}
-
-void Motion::enableMotors()
-{
-    digitalWrite(RADIUS_EN_PIN, LOW);
-    digitalWrite(THETA_EN_PIN, LOW);
-    Serial.println(F("✓ Motors enabled"));
-}
-
-void Motion::disableMotors()
-{
-    digitalWrite(RADIUS_EN_PIN, HIGH);
-    digitalWrite(THETA_EN_PIN, HIGH);
-    Serial.println(F("Motors disabled"));
-}
-
-float Motion::getRadiusMM()
-{
-    return radiusStepsToMM(radiusStepper.currentPosition());
-}
-
-float Motion::getThetaDegrees()
-{
-    return thetaStepsToDegrees(thetaStepper.currentPosition());
-}
-
-void Motion::printDriverStatus()
-{
-    Serial.println(F("\nDriver Status:"));
-
-    // Radius driver
-    Serial.print(F("  Radius - "));
-    if (radiusDriver.ot())
-        Serial.print(F("OVERTEMP! "));
-    if (radiusDriver.otpw())
-        Serial.print(F("TEMP_WARNING "));
-    if (radiusDriver.s2ga() || radiusDriver.s2gb())
-        Serial.print(F("SHORT_GND! "));
-    Serial.print(F("Standstill: "));
-    Serial.println(radiusDriver.stst() ? F("Yes") : F("No"));
-
-    // Theta driver
-    Serial.print(F("  Theta  - "));
-    if (thetaDriver.ot())
-        Serial.print(F("OVERTEMP! "));
-    if (thetaDriver.otpw())
-        Serial.print(F("TEMP_WARNING "));
-    if (thetaDriver.s2ga() || thetaDriver.s2gb())
-        Serial.print(F("SHORT_GND! "));
-    Serial.print(F("Standstill: "));
-    Serial.println(thetaDriver.stst() ? F("Yes") : F("No"));
-}
-
-// ===== Private Helper Methods =====
-
-void Motion::setupTMCDrivers()
-{
-    // === Radius Motor Configuration ===
-    radiusDriver.begin();                             // Initialize driver
-    radiusDriver.mstep_reg_select(true);              // Use MSTEP register for microstepping
-    radiusDriver.I_scale_analog(false);               // Use internal current reference
-    radiusDriver.toff(4);                             // Enable driver (off time = 4)
-    radiusDriver.rms_current(RADIUS_MOTOR_CURRENT);   // Set motor current
-    radiusDriver.microsteps(MICROSTEPS);              // Set microstepping
-    radiusDriver.en_spreadCycle(RADIUS_SPREAD_CYCLE); // Chopper mode
-    radiusDriver.pwm_autoscale(true);                 // Enable automatic current scaling
-    radiusDriver.TPOWERDOWN(128);                     // ~2 seconds standstill before power down
-
-    // === Theta Motor Configuration ===
-    thetaDriver.begin();                              // Initialize driver
-    thetaDriver.mstep_reg_select(true);               // Use MSTEP register for microstepping
-    thetaDriver.I_scale_analog(false);                // Use internal current reference
-    thetaDriver.toff(4);
-    thetaDriver.rms_current(THETA_MOTOR_CURRENT);
-    thetaDriver.microsteps(MICROSTEPS);
-    thetaDriver.en_spreadCycle(THETA_SPREAD_CYCLE);
-    thetaDriver.pwm_autoscale(true);
-    thetaDriver.TPOWERDOWN(128);
-
-    Serial.println(F("✓ TMC2208 registers configured"));
-    Serial.print(F("  Radius motor: "));
-    Serial.print(RADIUS_MOTOR_CURRENT);
-    Serial.println(F("mA RMS"));
-    Serial.print(F("  Theta motor:  "));
-    Serial.print(THETA_MOTOR_CURRENT);
-    Serial.println(F("mA RMS"));
-    Serial.print(F("  Microstepping: 1/"));
-    Serial.println(MICROSTEPS);
-    Serial.print(F("  Mode: "));
-    Serial.println(RADIUS_SPREAD_CYCLE ? F("SpreadCycle") : F("StealthChop (silent)"));
-}
-
-bool Motion::testDriverCommunication()
-{
-    bool radiusOK = false;
-    bool thetaOK = false;
-
-    // Test radius driver
-    Serial.print(F("  Radius (Serial3 - TX=14, RX=15): "));
-
-    uint32_t radiusGCONF = radiusDriver.GCONF();
-    if (radiusGCONF != 0 && radiusGCONF != 0xFFFFFFFF)
-    {
-        radiusOK = true;
-        Serial.print(F("✓ GCONF=0x"));
-        Serial.println(radiusGCONF, HEX);
-    }
-    else
-    {
-        Serial.print(F("✗ No response (GCONF=0x"));
-        Serial.print(radiusGCONF, HEX);
-        Serial.println(F(")"));
-    }
-
-    // Test theta driver
-    Serial.print(F("  Theta (Serial1 - TX=18, RX=19): "));
-
-    uint32_t thetaGCONF = thetaDriver.GCONF();
-    if (thetaGCONF != 0 && thetaGCONF != 0xFFFFFFFF)
-    {
-        thetaOK = true;
-        Serial.print(F("✓ GCONF=0x"));
-        Serial.println(thetaGCONF, HEX);
-    }
-    else
-    {
-        Serial.print(F("✗ No response (GCONF=0x"));
-        Serial.print(thetaGCONF, HEX);
-        Serial.println(F(")"));
-    }
-
-    if (!radiusOK || !thetaOK)
-    {
-        Serial.println(F("\n  Troubleshooting steps:"));
-        if (!radiusOK)
-        {
-            Serial.println(F("  Radius driver:"));
-            Serial.println(F("    - Verify Serial3 pins (TX=14, RX=15) → driver PDN_UART pin"));
-            Serial.println(F("    - Check MS1/MS2 pins are HIGH (floating or tied to VCC)"));
-            Serial.println(F("    - Verify driver has power (VM and VIO)"));
-        }
-        if (!thetaOK)
-        {
-            Serial.println(F("  Theta driver:"));
-            Serial.println(F("    - Verify Serial1 pins (TX=18, RX=19) → driver PDN_UART pin"));
-            Serial.println(F("    - Check MS1/MS2 pins are HIGH (floating or tied to VCC)"));
-            Serial.println(F("    - Verify driver has power (VM and VIO)"));
-            Serial.println(F("    - Try swapping driver positions to test if hardware faulty"));
-        }
-    }
-
-    return radiusOK && thetaOK;
-}
-
-void Motion::checkEndstops()
-{
-    if (!m_isHoming)
-        return;
-
-    bool radiusTriggered = digitalRead(RADIUS_ENDSTOP_PIN) == LOW;
-    bool thetaTriggered = digitalRead(THETA_ENDSTOP_PIN) == LOW;
-
-    if (thetaTriggered)
-    {
-        thetaStepper.stop();
-        Serial.println(F("⚠ Theta endstop triggered!"));
-        if (m_isHomingTheta)
-        {
-            m_isHomingTheta = false;
-            homeRadius();
-        }
-    }
-
-    if (radiusTriggered)
-    {
-        radiusStepper.stop();
-        Serial.println(F("⚠ Radius endstop triggered!"));
-        if (m_isHomingRadius)
-        {
-            m_isHomingRadius = false;
+        if (!m_homingManager.run(m_stepper)) {
             m_isHoming = false;
-            Serial.println(F("✓ Homing complete!"));
+            if (m_homingManager.isComplete()) {
+                m_positionKnown = true;
+                Serial.println(F("Homing complete"));
+            } else {
+                Serial.println(F("Homing failed"));
+            }
         }
+        return;
+    }
+
+    // Normal operation: refill LUT for ISR-driven stepping
+    if (!timerBackendIsComplete()) {
+        timerBackendRefillLUT(m_stepper);
+
+        // Periodic ISR diagnostic (every ~1 second at 16MHz loop rate)
+        static uint32_t lastDiagMillis = 0;
+        uint32_t now = millis();
+        if (now - lastDiagMillis >= 1000) {
+            lastDiagMillis = now;
+            Serial.print(F("[MOT] ISR fires="));
+            Serial.print(timerBackendISRCount());
+            Serial.print(F(" remaining="));
+            Serial.println(timerBackendStepsRemaining());
+        }
+    } else if (!m_stepper.isComplete()) {
+        // ISR finished all steps — mark stepper complete so the next command can run
+        m_stepper.markComplete();
+        Serial.print(F("[MOT] move complete, ISR fires="));
+        Serial.println(timerBackendISRCount());
     }
 }
 
-void Motion::homeTheta()
-{
-    Serial.println(F("Homing theta..."));
-    long thetaSteps = -THETA_MAX_HOMING_DEGREES * THETA_STEPS_PER_DEGREE;
-    long radiusCompensation = calculateRadiusCompensationSteps(thetaSteps);
-    thetaStepper.move(thetaSteps);
-    radiusStepper.move(radiusCompensation);
-    m_isHomingTheta = true;
+bool Motion::isMovementComplete() {
+    if (m_isHoming) return false;
+    return m_stepper.isComplete() && timerBackendIsComplete();
 }
 
-void Motion::homeRadius()
-{
-    Serial.println(F("Homing radius..."));
-    radiusStepper.move(-RADIUS_MAX_HOMING_MM * RADIUS_STEPS_PER_MM);
-    m_isHomingRadius = true;
+void Motion::enableMotors(bool radius, bool theta) {
+    Serial.print(F("[MOT] enableMotors R="));
+    Serial.print(radius ? F("Y") : F("N"));
+    Serial.print(F(" T="));
+    Serial.println(theta ? F("Y") : F("N"));
+    if (radius) m_stepper.radiusAxis().enable(true);
+    if (theta) m_stepper.thetaAxis().enable(true);
 }
 
-// ===== Unit Conversion Methods =====
-
-long Motion::radiusMMToSteps(float mm)
-{
-    return (long)(mm * RADIUS_STEPS_PER_MM);
+void Motion::disableMotors(bool radius, bool theta) {
+    if (radius) m_stepper.radiusAxis().enable(false);
+    if (theta) m_stepper.thetaAxis().enable(false);
+    timerBackendStop();
 }
 
-long Motion::thetaDegreesToSteps(float degrees)
-{
-    return (long)(degrees * THETA_STEPS_PER_DEGREE);
+float Motion::getRadiusMM() {
+    return m_stepper.getRadiusMM();
 }
 
-float Motion::radiusStepsToMM(long steps)
-{
-    return (float)steps / RADIUS_STEPS_PER_MM;
+float Motion::getThetaDegrees() {
+    return m_stepper.getThetaDegrees();
 }
 
-float Motion::thetaStepsToDegrees(long steps)
-{
-    return (float)steps / THETA_STEPS_PER_DEGREE;
+void Motion::setPosition(float radiusMM, float thetaDegrees) {
+    Serial.print(F("[MOT] setPosition R="));
+    Serial.print(radiusMM, 2);
+    Serial.print(F(" A="));
+    Serial.println(thetaDegrees, 2);
+    m_stepper.setPosition(radiusMM, thetaDegrees);
+    m_positionKnown = true;
 }
 
-// ===== Radius Compensation Methods =====
+void Motion::printDriverStatus() {
+    Serial.println(F("=== TMC2208 Driver Status ==="));
 
-long Motion::calculateRadiusCompensation(float thetaDegrees)
-{
-    // Calculate how many steps the radius motor needs to move
-    // to compensate for theta rotation and maintain constant radius
-    return (long)(thetaDegrees * RADIUS_STEPS_PER_THETA_DEGREE);
-}
+    Serial.println(F("-- Radius Driver --"));
+    Serial.print(F("  Enabled: "));
+    Serial.println(m_radiusDriver->isEnabled() ? F("yes") : F("no"));
+    Serial.print(F("  Current (mA): "));
+    Serial.println(m_radiusDriver->rms_current());
+    Serial.print(F("  Microsteps: "));
+    Serial.println(m_radiusDriver->microsteps());
+    Serial.print(F("  StealthChop: "));
+    Serial.println(!m_radiusDriver->en_spreadCycle() ? F("yes") : F("no"));
 
-long Motion::calculateRadiusCompensationSteps(long thetaSteps)
-{
-    // Calculate radius compensation from theta steps
-    // Convert theta steps to degrees first, then calculate compensation
-    float thetaDegrees = thetaStepsToDegrees(thetaSteps);
-    return calculateRadiusCompensation(thetaDegrees);
+    Serial.println(F("-- Theta Driver --"));
+    Serial.print(F("  Enabled: "));
+    Serial.println(m_thetaDriver->isEnabled() ? F("yes") : F("no"));
+    Serial.print(F("  Current (mA): "));
+    Serial.println(m_thetaDriver->rms_current());
+    Serial.print(F("  Microsteps: "));
+    Serial.println(m_thetaDriver->microsteps());
+    Serial.print(F("  StealthChop: "));
+    Serial.println(!m_thetaDriver->en_spreadCycle() ? F("yes") : F("no"));
+
+    Serial.println(F("-- Position --"));
+    Serial.print(F("  Radius: "));
+    Serial.print(getRadiusMM(), 2);
+    Serial.println(F(" mm"));
+    Serial.print(F("  Theta: "));
+    Serial.print(getThetaDegrees(), 2);
+    Serial.println(F(" deg"));
 }

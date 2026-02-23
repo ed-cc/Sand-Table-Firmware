@@ -1,58 +1,73 @@
 #include <Arduino.h>
 #include "motion.h"
+#include "serial_reader.h"
+#include "gcode_interpreter.h"
+#include "motion_commander.h"
 
-// Create motion controller instance
+// Motion controller
 Motion motion;
 
-bool homed = false;
+// Buffers
+RingBuffer<GCodeLine, GCODE_BUFFER_CAPACITY> gcodeBuffer;
+RingBuffer<MoveCommand, MOVE_BUFFER_CAPACITY> moveBuffer;
+
+// Callbacks
+void emergencyStop()
+{
+  motion.disableMotors();
+}
+
+void getStatus(MachineStatus &status)
+{
+  status.radius = motion.getRadiusMM();
+  status.theta = motion.getThetaDegrees();
+  status.feedrate = motion.getFeedrate();
+  status.isMoving = !motion.isMovementComplete();
+}
+
+void onResume()
+{
+  motion.enableMotors();
+}
+
+// Pipeline stages
+SerialReader serialReader(gcodeBuffer, emergencyStop, getStatus, onResume);
+GCodeInterpreter gcodeInterpreter(gcodeBuffer, moveBuffer, getStatus);
+MotionCommander motionCommander(moveBuffer, motion);
+
+// Round-robin counter for pipeline scheduling
+uint8_t pipelineSlot = 0;
 
 void setup()
 {
-  // Initialize USB Serial for debugging
   Serial.begin(115200);
   while (!Serial && millis() < 3000)
-    ; // Wait up to 3 seconds for Serial
+    delay(1);
   Serial.println(F("Sand Table - Motion Control System"));
   Serial.println(F("==================================="));
 
-  // Initialize motion system (TMC drivers and steppers)
   motion.setupSteppers();
 
-  Serial.println(F("Setup complete! Ready for motion.\n"));
+  Serial.println(F("Ready. Awaiting G-code commands."));
 }
 
 void loop()
 {
-  // Run the steppers (non-blocking)
+  // Stepper timing is the highest priority
   motion.run();
 
-  if (!homed)
+  // Round-robin one pipeline stage per iteration
+  switch (pipelineSlot)
   {
-    // Start homing sequence
-    motion.home();
-    homed = true;
+  case 0:
+    serialReader.run();
+    break;
+  case 1:
+    gcodeInterpreter.run();
+    break;
+  case 2:
+    motionCommander.run();
+    break;
   }
-  while( motion.isHoming() )
-  {
-    motion.run();
-  }
-
-  // Example: Simple test movement every 5 seconds
-  static unsigned long lastMove = 0;
-  static bool moveState = false;
-
-  if (millis() - lastMove > 5000)
-  {
-    lastMove = millis();
-    moveState = !moveState;
-
-    if (moveState)
-    {
-      motion.moveTo(100.0, 90.0);
-    }
-    else
-    {
-      motion.moveTo(100.0, 360.0);
-    }
-  }
+  pipelineSlot = (pipelineSlot + 1) % 3;
 }

@@ -1,11 +1,23 @@
-// motion.h - Motion control class for Sand Table
+// motion.h - Motion control wrapper for Sand Table
+//
+// Thin wrapper around CoordinatedStepper providing:
+// - TMC2208 driver setup and configuration
+// - Homing sequence (endstop-based)
+// - Motor enable/disable
+// - Feedrate management
+// - Position safety limits
+//
+// All motion planning, stepping, compensation, and unit conversion
+// are handled by CoordinatedStepper.
+
 #ifndef MOTION_H
 #define MOTION_H
 
 #include <Arduino.h>
 #include <TMCStepper.h>
-#include <AccelStepper.h>
 #include "values.h"
+#include "coordinated_stepper.h"
+#include "homing_manager.h"
 
 class Motion
 {
@@ -34,51 +46,36 @@ public:
     bool isHoming() { return m_isHoming; }
 
     // Enable/disable motors
-    void enableMotors();
-    void disableMotors();
+    void enableMotors(bool radius = true, bool theta = true);
+    void disableMotors(bool radius = true, bool theta = true);
 
     // Get current position in user units
     float getRadiusMM();
     float getThetaDegrees();
 
+    // Set current position without moving (G92)
+    void setPosition(float radiusMM, float thetaDegrees);
+
+    // Whether we have a known position (after homing or G92)
+    bool isPositionKnown() const { return m_positionKnown; }
+
+    // Feedrate (mm/min)
+    void setFeedrate(float feedrate) { m_feedrate = feedrate; }
+    float getFeedrate() const { return m_feedrate; }
+
     // Print driver status for debugging
     void printDriverStatus();
 
 private:
-    // TMC2208 drivers using hardware serial
-    TMC2208Stepper radiusDriver;
-    TMC2208Stepper thetaDriver;
+    CoordinatedStepper m_stepper;
+    HomingManager      m_homingManager;
 
-    // AccelStepper objects
-    AccelStepper radiusStepper;
-    AccelStepper thetaStepper;
+    TMC2208Stepper*    m_radiusDriver;
+    TMC2208Stepper*    m_thetaDriver;
 
-    // Helper methods
-    void setupTMCDrivers();
-    bool testDriverCommunication();
-
-    // Homing methods
-    void homeTheta();
-    void homeRadius();
-
-    // Check endstop status
-    void checkEndstops();
-
-    // Convert between user units and steps
-    long radiusMMToSteps(float mm);
-    long thetaDegreesToSteps(float degrees);
-    float radiusStepsToMM(long steps);
-    float thetaStepsToDegrees(long steps);
-
-    // Radius compensation for theta motion (mechanical linkage)
-    long calculateRadiusCompensation(float thetaDegrees);
-    long calculateRadiusCompensationSteps(long thetaSteps);
-
-    // Member variables
-    bool m_isHoming;
-    bool m_isHomingTheta;
-    bool m_isHomingRadius;
-    bool m_motorsEnabled;
+    bool  m_isHoming;
+    bool  m_positionKnown;
+    float m_feedrate;       // mm/min
 };
 
 #endif // MOTION_H
