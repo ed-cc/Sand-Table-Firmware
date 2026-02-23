@@ -145,4 +145,35 @@
 #define RADIUS_ENDSTOP_PULLUP true   // Enable internal pullup for NO switch
 #define THETA_ENDSTOP_PULLUP true    // Enable internal pullup for NO switch
 
+// ===== Lookahead Planner Constants =====
+
+// Junction deviation in physical millimetres.
+// The maximum path deviation at a corner. Increase (up to ~0.2 mm) for faster
+// cornering; decrease for tighter path following.
+#define JUNCTION_DEVIATION_MM       0.05f
+
+// Minimum operating radius [mm]. Below this, theta arc-length is too small for
+// reliable junction planning. Pure theta moves at R < R_MIN require a full stop.
+#define PLANNER_R_MIN_MM            1.0f
+
+// Maximum speed for radius axis direction changes [mm/s physical].
+// At 2 mm/s the step interval is >>20ns, satisfying TMC DIR setup time.
+#define DIR_CHANGE_MAX_SPEED_MMPS   2.0f
+
+// Collinear merge: minimum dot product for two moves to be considered collinear.
+// cos(1 deg) ~ 0.9998.
+#define COLLINEAR_DOT_THRESHOLD     0.9998f
+
+// Planner block buffer capacity.
+#define PLANNER_BUFFER_CAPACITY     16
+
+// AVR: maximum steps pre-computed per move sequence.
+// Limited by SRAM: 3000 x 2 bytes = 6 KB, leaving ~650 bytes spare.
+#define AVR_MAX_PRECOMPUTE_STEPS    3000
+
+// Default physical acceleration and jerk for the planner [mm/s^2, mm/s^3].
+// Derived from radius axis: RADIUS_ACCELERATION / RADIUS_STEPS_PER_MM.
+#define DEFAULT_PHYS_ACCEL_MMPS2    (RADIUS_ACCELERATION / RADIUS_STEPS_PER_MM)
+#define DEFAULT_PHYS_JERK_MMPS3     (RADIUS_JERK / RADIUS_STEPS_PER_MM)
+
 #endif // VALUES_H
