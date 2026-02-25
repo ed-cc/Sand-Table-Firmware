@@ -9,6 +9,7 @@ GCodeInterpreter::GCodeInterpreter(
     : m_gcodeBuffer(gcodeBuffer)
     , m_moveBuffer(moveBuffer)
     , m_onStatusQuery(onStatusQuery)
+    , m_onSubprogramCall(nullptr)
     , m_absoluteMode(true)
     , m_activeMotion(0)
     , m_feedrate(0)
@@ -50,8 +51,12 @@ void GCodeInterpreter::beginLine() {
     m_rVal = NAN;
     m_aVal = NAN;
     m_fVal = NAN;
+    m_pVal = NAN;
+    m_lVal = NAN;
     m_hasR = false;
     m_hasA = false;
+    m_hasP = false;
+    m_hasL = false;
 
     m_state = INTERP_PARSING;
 }
@@ -102,6 +107,8 @@ void GCodeInterpreter::parseNextToken() {
         case 'R': m_rVal = value; m_hasR = true; break;
         case 'A': m_aVal = value; m_hasA = true; break;
         case 'F': m_fVal = value; break;
+        case 'P': m_pVal = value; m_hasP = true; break;
+        case 'L': m_lVal = value; m_hasL = true; break;
     }
 
     m_parsePos = p - m_line;
@@ -175,6 +182,22 @@ void GCodeInterpreter::executeLine() {
                 Serial.print(status.theta, 2);
                 Serial.print(F(" F:"));
                 Serial.println(status.feedrate, 0);
+                break;
+            }
+            case 98: {
+                if (!m_hasP) {
+                    Serial.println(F("error: M98 requires P parameter"));
+                    break;
+                }
+                uint16_t reps = m_hasL ? (uint16_t)m_lVal : 1;
+                if (m_onSubprogramCall) {
+                    if (!m_onSubprogramCall((uint8_t)m_pVal, reps)) {
+                        Serial.print(F("error: Unknown subprogram P"));
+                        Serial.println((int)m_pVal);
+                    }
+                } else {
+                    Serial.println(F("error: Subprograms not available"));
+                }
                 break;
             }
             case 115:

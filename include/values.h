@@ -165,11 +165,13 @@
 #define COLLINEAR_DOT_THRESHOLD     0.9998f
 
 // Planner block buffer capacity.
-#define PLANNER_BUFFER_CAPACITY     16
+// Reduced from 16 to 8 to fit AVR SRAM budget (saves ~570 bytes).
+#define PLANNER_BUFFER_CAPACITY     8
 
 // AVR: maximum steps pre-computed per move sequence.
-// Limited by SRAM: 3000 x 2 bytes = 6 KB, leaving ~650 bytes spare.
-#define AVR_MAX_PRECOMPUTE_STEPS    3000
+// Limited by SRAM: 1500 x 2 bytes = 3 KB. With 8 blocks and reduced
+// gcode/move buffers this leaves ~2.5 KB for stack.
+#define AVR_MAX_PRECOMPUTE_STEPS    1400
 
 // Default physical acceleration and jerk for the planner [mm/s^2, mm/s^3].
 // Derived from radius axis: RADIUS_ACCELERATION / RADIUS_STEPS_PER_MM.

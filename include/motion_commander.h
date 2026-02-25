@@ -23,7 +23,10 @@ private:
     RingBuffer<MoveCommand, MOVE_BUFFER_CAPACITY>& m_moveBuffer;
     Motion& m_motion;
 
-    void dispatch(const MoveCommand& cmd);
+    MoveCommand m_pending;
+    bool m_hasPending;
+
+    bool tryDispatch(const MoveCommand& cmd);
 };
 
 #endif // MOTION_COMMANDER_H

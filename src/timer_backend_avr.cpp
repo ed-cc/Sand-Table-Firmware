@@ -3,6 +3,13 @@
 // Timer3: Master ISR for dominant-axis stepping + Bresenham minor-axis
 // Timer3 CompB: Drives STEP pins LOW after minimum pulse width
 // Timer4: Reserved for pure-minor-axis moves (future use)
+//
+// Two execution modes:
+//   Single-move (s_multiBlockMode == false):
+//     Double-buffered LUT[0..1023], circular read. Used by homing path.
+//   Multi-block (s_multiBlockMode == true):
+//     Linear LUT[0..AVR_MAX_PRECOMPUTE_STEPS-1] with BlockMeta array.
+//     Seamless ISR block transitions via load_next_block().
 
 #ifndef UNIT_TEST
 
@@ -12,23 +19,45 @@
 #include <Arduino.h>
 #include <avr/interrupt.h>
 
-// ===== Shared state between main loop and ISR =====
+// ===== LUT: shared between single-move and multi-block modes =====
+// Single-move uses [0..LUT_TOTAL_SIZE-1] (1024 entries, double-buffered).
+// Multi-block uses [0..AVR_MAX_PRECOMPUTE_STEPS-1] (3000 entries, linear).
+static uint16_t s_lut[AVR_MAX_PRECOMPUTE_STEPS];
 
-// LUT double-buffer: ISR reads one half while main loop fills the other.
-// The ISR wraps s_lutIndex circularly through 0..LUT_TOTAL_SIZE-1.
-// When it crosses the midpoint or wraps around, it signals s_needRefill
-// so the main loop can fill the inactive half with the next profile steps.
-static uint16_t s_lut[LUT_TOTAL_SIZE];
-static volatile int16_t s_lutIndex = 0;       // circular read position (0 to LUT_TOTAL_SIZE-1)
-static volatile bool s_firstHalfActive = true; // which half the ISR is currently reading
-static volatile bool s_needRefill = false;     // main loop should refill inactive half
-static int32_t s_nextComputeStep = 0;          // next profile step to compute into LUT (main loop only)
-static volatile bool s_lutExhausted = false;   // true if no more profile steps to fill
+// ===== Mode flag =====
+static volatile bool s_multiBlockMode = false;
 
-// Move state accessed from ISR
+// ===== Single-move mode state =====
+static volatile int16_t s_lutIndex = 0;
+static volatile bool s_firstHalfActive = true;
+static volatile bool s_needRefill = false;
+static int32_t s_nextComputeStep = 0;
+static volatile bool s_lutExhausted = false;
+
+// ===== Multi-block mode state =====
+static BlockMeta s_blockMeta[PLANNER_BUFFER_CAPACITY];
+static volatile uint8_t s_blockCount = 0;
+static volatile uint8_t s_currentBlockIdx = 0;
+static volatile uint16_t s_mbLutIndex = 0;      // linear read position
+static volatile uint16_t s_mbBlockEnd = 0;       // lut_start + lut_count for current block (deprecated, kept for compat)
+static volatile uint16_t s_mbTotalLutSize = 0;   // total entries in LUT
+
+// ===== Cruise phase compression support =====
+static volatile bool     s_cruiseMode = false;   // ISR in cruise phase repeat mode
+static volatile uint32_t s_cruiseRemaining = 0;  // steps left in cruise phase
+static volatile uint16_t s_cruiseInterval = 0;   // the interval to repeat during cruise
+static volatile int32_t  s_mbStepsInBlock = 0;   // step count for current block (replaces LUT boundary check)
+
+// ===== Constant-acceleration sentinel support =====
+static volatile bool     s_accelMode = false;      // ISR in const-accel/decel computation mode
+static volatile uint32_t s_accelRemaining = 0;     // steps left in accel sentinel
+static volatile uint32_t s_accelVelocity = 0;      // Q16.16 velocity (steps/sec * 65536)
+static volatile int32_t  s_accelRate = 0;           // Q16.16 acceleration per step (signed)
+
+// ===== Common move state =====
 static volatile bool s_moveActive = false;
 static volatile int32_t s_stepsRemaining = 0;
-static volatile int32_t s_isrFireCount = 0;  // diagnostic: total ISR fires
+static volatile int32_t s_isrFireCount = 0;
 
 // Axis port registers cached for ISR (set at move start)
 static volatile uint8_t* s_domStepPort = nullptr;
@@ -46,8 +75,22 @@ static volatile int32_t s_bresMinor = 0;
 static StepperAxis* s_domAxis = nullptr;
 static StepperAxis* s_minAxis = nullptr;
 
+// Axis pointers for multi-block direction switching
+static StepperAxis* s_thetaAxis = nullptr;
+static StepperAxis* s_radiusAxis = nullptr;
+
 // Prescaler state
 static volatile bool s_usingPrescaler8 = false;
+
+// Abort / stall flags
+static volatile bool s_abortRequested = false;
+static volatile bool s_stalled = false;
+
+// Forced deceleration state
+static volatile bool s_forcedDecel = false;
+static volatile uint16_t s_forcedDecelInterval = 0;
+static const uint16_t FORCED_DECEL_INCREMENT = 50;        // ticks added per step
+static const uint16_t FORCED_DECEL_STOP_INTERVAL = 60000; // stop threshold
 
 // ===== Timer Configuration =====
 
@@ -58,10 +101,9 @@ void timerBackendInit() {
     TCCR3A = 0;
     TCCR3B = 0;
     TCNT3  = 0;
-    OCR3A  = 65535;               // Start at slowest rate (motor stopped)
-    TCCR3B |= (1 << WGM32);      // CTC mode
-    TCCR3B |= (1 << CS30);       // Prescaler = 1 (16 MHz tick)
-    // Don't enable interrupt yet — enabled when a move starts
+    OCR3A  = 65535;
+    TCCR3B |= (1 << WGM32);
+    TCCR3B |= (1 << CS30);
     TIMSK3 &= ~(1 << OCIE3A);
     TIMSK3 &= ~(1 << OCIE3B);
 
@@ -75,9 +117,15 @@ void timerBackendInit() {
     TIMSK4 &= ~(1 << OCIE4A);
 
     s_moveActive = false;
+    s_multiBlockMode = false;
+    s_abortRequested = false;
+    s_stalled = false;
+    s_forcedDecel = false;
 
     interrupts();
 }
+
+// ===== Single-move mode (backward compatible, for homing) =====
 
 void timerBackendStartMove(CoordinatedStepper& stepper) {
     if (stepper.isComplete()) {
@@ -91,6 +139,10 @@ void timerBackendStartMove(CoordinatedStepper& stepper) {
     TIMSK3 &= ~(1 << OCIE3A);
     TIMSK3 &= ~(1 << OCIE3B);
     s_moveActive = false;
+    s_multiBlockMode = false;
+    s_abortRequested = false;
+    s_stalled = false;
+    s_forcedDecel = false;
 
     const SCurveProfile& prof = stepper.profile();
     s_stepsRemaining = prof.totalSteps();
@@ -125,11 +177,11 @@ void timerBackendStartMove(CoordinatedStepper& stepper) {
     s_bresMinor = absMin;
     s_bresError = absDom / 2;
 
-    // Precompute first LUT block
+    // Precompute first LUT block (uses only first LUT_TOTAL_SIZE entries)
     int32_t count = prof.precomputeLUT(s_lut, LUT_TOTAL_SIZE, F_CPU);
-    s_nextComputeStep = count;  // next profile step to compute on refill
+    s_nextComputeStep = count;
     s_lutExhausted = (count >= prof.totalSteps());
-    s_lutIndex = 1;  // s_lut[0] is used as the initial OCR3A; ISR reads from [1] onward
+    s_lutIndex = 1;  // s_lut[0] is used as the initial OCR3A
     s_firstHalfActive = true;
     s_needRefill = false;
 
@@ -138,10 +190,9 @@ void timerBackendStartMove(CoordinatedStepper& stepper) {
 
     // Check if we need prescaler 8 for slow start
     if (firstInterval >= 65535) {
-        // Switch to prescaler 8 for slow speeds
         TCCR3B = (1 << WGM32) | (1 << CS31);  // prescaler = 8
         s_usingPrescaler8 = true;
-        firstInterval = firstInterval >> 3;  // Adjust for prescaler
+        firstInterval = firstInterval >> 3;
         if (firstInterval < 1) firstInterval = 1;
     } else {
         TCCR3B = (1 << WGM32) | (1 << CS30);  // prescaler = 1
@@ -154,7 +205,6 @@ void timerBackendStartMove(CoordinatedStepper& stepper) {
     s_isrFireCount = 0;
     s_moveActive = true;
 
-    // Enable Timer3 CompA interrupt to start stepping
     TIMSK3 |= (1 << OCIE3A);
 
     interrupts();
@@ -173,27 +223,17 @@ void timerBackendStartMove(CoordinatedStepper& stepper) {
     Serial.println(s_usingPrescaler8 ? F("8") : F("1"));
 }
 
-void timerBackendStop() {
-    noInterrupts();
-    TIMSK3 &= ~(1 << OCIE3A);
-    TIMSK3 &= ~(1 << OCIE3B);
-    TIMSK4 &= ~(1 << OCIE4A);
-    s_moveActive = false;
-    interrupts();
-}
-
 bool timerBackendRefillLUT(CoordinatedStepper& stepper) {
     if (!s_moveActive) return false;
+    if (s_multiBlockMode) return true;  // multi-block doesn't use refill
     if (!s_needRefill) return true;
 
     const SCurveProfile& prof = stepper.profile();
 
-    // How many profile steps remain to be computed?
     int32_t remaining = prof.totalSteps() - s_nextComputeStep;
     int32_t toCompute = (remaining < LUT_HALF_SIZE) ? remaining : LUT_HALF_SIZE;
 
     if (toCompute <= 0) {
-        // No more steps to compute — mark exhausted so ISR stops requesting refills
         noInterrupts();
         s_lutExhausted = true;
         s_needRefill = false;
@@ -201,15 +241,13 @@ bool timerBackendRefillLUT(CoordinatedStepper& stepper) {
         return true;
     }
 
-    // Determine which half to refill (opposite of what ISR is reading)
     int16_t refillStart;
     if (s_firstHalfActive) {
-        refillStart = LUT_HALF_SIZE;  // ISR reading first half → refill second
+        refillStart = LUT_HALF_SIZE;
     } else {
-        refillStart = 0;              // ISR reading second half → refill first
+        refillStart = 0;
     }
 
-    // Compute intervals for this block using tracked profile step position
     prof.computeIntervalBlock(s_nextComputeStep, &s_lut[refillStart], toCompute, F_CPU);
     s_nextComputeStep += toCompute;
 
@@ -223,8 +261,197 @@ bool timerBackendRefillLUT(CoordinatedStepper& stepper) {
     return true;
 }
 
+// ===== Multi-block mode =====
+
+// Inline helper: load the next block's Bresenham/direction state.
+// Called from within the ISR when the current block's LUT entries are exhausted.
+// Returns true if a block was loaded, false if all blocks are done.
+static inline bool load_next_block() __attribute__((always_inline));
+static inline bool load_next_block() {
+    s_currentBlockIdx++;
+    if (s_currentBlockIdx >= s_blockCount) {
+        return false;
+    }
+
+    const BlockMeta& meta = s_blockMeta[s_currentBlockIdx];
+
+    // Update Bresenham state
+    s_bresDominant = meta.bres_dom;
+    s_bresMinor = meta.bres_minor;
+    s_bresError = meta.bres_dom / 2;
+
+    // Update dominant/minor axis assignments
+    if (meta.theta_dominant) {
+        s_domAxis = s_thetaAxis;
+        s_minAxis = s_radiusAxis;
+    } else {
+        s_domAxis = s_radiusAxis;
+        s_minAxis = s_thetaAxis;
+    }
+
+    // Update port register caches
+    s_domStepPort = s_domAxis->stepPort;
+    s_domStepMask = s_domAxis->stepMask;
+    s_minStepPort = s_minAxis->stepPort;
+    s_minStepMask = s_minAxis->stepMask;
+
+    // Update directions if changed
+    if (s_thetaAxis->direction() != meta.dir_theta) {
+        s_thetaAxis->setDirection(meta.dir_theta);
+    }
+    if (s_radiusAxis->direction() != meta.dir_radius) {
+        s_radiusAxis->setDirection(meta.dir_radius);
+    }
+
+    // Update LUT read position and block boundary
+    s_mbLutIndex = meta.lut_start;
+    s_mbBlockEnd = meta.lut_start + meta.lut_count;
+
+    // Update step counting for block boundary detection (replaces LUT boundary check)
+    s_mbStepsInBlock = meta.bres_dom;
+
+    // Reset compression modes for new block
+    s_cruiseMode = false;
+    s_cruiseRemaining = 0;
+    s_accelMode = false;
+    s_accelRemaining = 0;
+
+    // stepsRemaining tracks total steps (for diagnostics)
+    s_stepsRemaining = meta.bres_dom;
+
+    return true;
+}
+
+uint16_t* timerBackendGetLutBuffer() {
+    return s_lut;
+}
+
+void timerBackendLoadPlan(const BlockMeta* metas, uint8_t blockCount,
+                          uint16_t lutSize,
+                          StepperAxis* thetaAxis, StepperAxis* radiusAxis) {
+    if (blockCount == 0 || lutSize == 0) return;
+
+    noInterrupts();
+
+    // Stop any active move
+    TIMSK3 &= ~(1 << OCIE3A);
+    TIMSK3 &= ~(1 << OCIE3B);
+    s_moveActive = false;
+
+    // Copy block metadata
+    uint8_t count = (blockCount > PLANNER_BUFFER_CAPACITY) ? PLANNER_BUFFER_CAPACITY : blockCount;
+    for (uint8_t i = 0; i < count; i++) {
+        s_blockMeta[i] = metas[i];
+    }
+    s_blockCount = count;
+
+    // LUT data already written directly into s_lut by the caller
+    s_mbTotalLutSize = (lutSize > AVR_MAX_PRECOMPUTE_STEPS) ? AVR_MAX_PRECOMPUTE_STEPS : lutSize;
+
+    // Store axis pointers for multi-block direction switching
+    s_thetaAxis = thetaAxis;
+    s_radiusAxis = radiusAxis;
+
+    // Set up first block
+    s_currentBlockIdx = 0;
+    const BlockMeta& first = s_blockMeta[0];
+
+    // Set directions
+    thetaAxis->setDirection(first.dir_theta);
+    radiusAxis->setDirection(first.dir_radius);
+
+    // Set dominant/minor for first block
+    if (first.theta_dominant) {
+        s_domAxis = thetaAxis;
+        s_minAxis = radiusAxis;
+    } else {
+        s_domAxis = radiusAxis;
+        s_minAxis = thetaAxis;
+    }
+
+    s_domStepPort = s_domAxis->stepPort;
+    s_domStepMask = s_domAxis->stepMask;
+    s_minStepPort = s_minAxis->stepPort;
+    s_minStepMask = s_minAxis->stepMask;
+    s_minStepPendingLow = false;
+
+    // Bresenham for first block
+    s_bresDominant = first.bres_dom;
+    s_bresMinor = first.bres_minor;
+    s_bresError = first.bres_dom / 2;
+
+    // LUT read position and step counting
+    s_mbLutIndex = first.lut_start + 1;  // skip first entry used as initial OCR3A
+    s_mbBlockEnd = first.lut_start + first.lut_count;
+    s_mbStepsInBlock = first.bres_dom;  // step countdown for block boundary
+    s_stepsRemaining = first.bres_dom;  // total step count for this block
+
+    // Initialize compression state
+    s_cruiseMode = false;
+    s_cruiseRemaining = 0;
+    s_accelMode = false;
+    s_accelRemaining = 0;
+
+    // Mode flags
+    s_multiBlockMode = true;
+    s_abortRequested = false;
+    s_stalled = false;
+    s_forcedDecel = false;
+
+    // Set initial interval from first LUT entry
+    uint16_t firstInterval = s_lut[first.lut_start];
+
+    // Prescaler handling
+    if (firstInterval >= 65535) {
+        TCCR3B = (1 << WGM32) | (1 << CS31);  // prescaler = 8
+        s_usingPrescaler8 = true;
+        firstInterval = firstInterval >> 3;
+        if (firstInterval < 1) firstInterval = 1;
+    } else {
+        TCCR3B = (1 << WGM32) | (1 << CS30);  // prescaler = 1
+        s_usingPrescaler8 = false;
+    }
+
+    OCR3A = firstInterval;
+    TCNT3 = 0;
+
+    s_isrFireCount = 0;
+    s_moveActive = true;
+
+    TIMSK3 |= (1 << OCIE3A);
+
+    interrupts();
+
+    Serial.print(F("[TMR] Plan loaded: blocks="));
+    Serial.print(s_blockCount);
+    Serial.print(F(" lutSize="));
+    Serial.print(s_mbTotalLutSize);
+    Serial.print(F(" firstInterval="));
+    Serial.println(s_lut[first.lut_start]);
+}
+
+// ===== Common API =====
+
+void timerBackendStop() {
+    noInterrupts();
+    TIMSK3 &= ~(1 << OCIE3A);
+    TIMSK3 &= ~(1 << OCIE3B);
+    TIMSK4 &= ~(1 << OCIE4A);
+    s_moveActive = false;
+    s_forcedDecel = false;
+    interrupts();
+}
+
 bool timerBackendIsComplete() {
     return !s_moveActive;
+}
+
+void timerBackendAbort() {
+    s_abortRequested = true;
+}
+
+bool timerBackendIsStalled() {
+    return s_stalled;
 }
 
 int32_t timerBackendISRCount() {
@@ -243,16 +470,56 @@ int32_t timerBackendStepsRemaining() {
 
 // ===== Timer3 CompA ISR: Master step ISR =====
 ISR(TIMER3_COMPA_vect) {
-    if (!s_moveActive || s_stepsRemaining <= 0) {
-        // Move complete — disable interrupt
+    if (!s_moveActive) {
         TIMSK3 &= ~(1 << OCIE3A);
-        s_moveActive = false;
         return;
     }
 
+    // Check abort request — enter forced deceleration
+    if (s_abortRequested && !s_forcedDecel) {
+        s_forcedDecel = true;
+        s_forcedDecelInterval = OCR3A;
+        s_abortRequested = false;
+    }
+
+    // Forced deceleration path: ramp down to stop regardless of LUT/blocks
+    if (s_forcedDecel) {
+        if (s_forcedDecelInterval >= FORCED_DECEL_STOP_INTERVAL) {
+            s_moveActive = false;
+            s_stalled = true;
+            TIMSK3 &= ~(1 << OCIE3A);
+            return;
+        }
+
+        // Still stepping during decel
+        *s_domStepPort |= s_domStepMask;
+        s_domAxis->advancePosition();
+        s_stepsRemaining--;
+        s_isrFireCount++;
+
+        // Bresenham minor
+        s_bresError += s_bresMinor;
+        if (s_bresError >= s_bresDominant) {
+            *s_minStepPort |= s_minStepMask;
+            s_minAxis->advancePosition();
+            s_bresError -= s_bresDominant;
+            s_minStepPendingLow = true;
+        }
+
+        // Ramp interval up (slow down)
+        s_forcedDecelInterval += FORCED_DECEL_INCREMENT;
+        OCR3A = s_forcedDecelInterval;
+
+        // Schedule STEP LOW
+        OCR3B = TCNT3 + PULSE_TICKS;
+        TIMSK3 |= (1 << OCIE3B);
+        return;
+    }
+
+    // ===== Normal stepping path =====
     s_isrFireCount++;
 
-    // 1. Fire dominant axis STEP HIGH (single-cycle PORT write)
+    // 1. Fire dominant axis STEP HIGH
     *s_domStepPort |= s_domStepMask;
     s_domAxis->advancePosition();
     s_stepsRemaining--;
@@ -260,44 +527,113 @@ ISR(TIMER3_COMPA_vect) {
     // 2. Bresenham: check if minor axis also steps
     s_bresError += s_bresMinor;
     if (s_bresError >= s_bresDominant) {
-        *s_minStepPort |= s_minStepMask;  // Minor STEP HIGH
+        *s_minStepPort |= s_minStepMask;
         s_minAxis->advancePosition();
         s_bresError -= s_bresDominant;
         s_minStepPendingLow = true;
     }
 
-    // 3. Read next interval from circular LUT
-    uint16_t nextInterval = s_lut[s_lutIndex];
-    s_lutIndex++;
+    // 3. Get next interval (mode-dependent)
+    uint16_t nextInterval;
 
-    // Check if we've crossed the half-boundary — signal refill of the other half
-    if (s_lutIndex == LUT_HALF_SIZE && s_firstHalfActive) {
-        s_firstHalfActive = false;
-        if (!s_lutExhausted) s_needRefill = true;
-    } else if (s_lutIndex == LUT_TOTAL_SIZE) {
-        s_lutIndex = 0;
-        s_firstHalfActive = true;
-        if (!s_lutExhausted) s_needRefill = true;
+    if (s_multiBlockMode) {
+        // Multi-block with cruise compression support
+        // Step 1: Check block boundary (step-count-based)
+        --s_mbStepsInBlock;
+        if (s_mbStepsInBlock <= 0) {
+            // Last step of this block just fired — load next block
+            if (!load_next_block()) {
+                // All blocks done
+                s_moveActive = false;
+                TIMSK3 &= ~(1 << OCIE3A);
+                OCR3B = TCNT3 + PULSE_TICKS;
+                TIMSK3 |= (1 << OCIE3B);
+                return;
+            }
+            // Fall through to read first interval of new block
+        }
+
+        // Step 2: Get next interval from compressed LUT
+        if (s_accelMode) {
+            // In constant-accel phase: compute interval from velocity
+            s_accelVelocity = (uint32_t)((int32_t)s_accelVelocity + s_accelRate);
+            uint16_t vel16 = (uint16_t)(s_accelVelocity >> 16);
+            nextInterval = (vel16 > 0) ? (uint16_t)((uint32_t)F_CPU / vel16) : 65535;
+            if (--s_accelRemaining == 0) {
+                s_accelMode = false;
+            }
+        } else if (s_cruiseMode) {
+            // In cruise phase: repeat the cruise interval
+            nextInterval = s_cruiseInterval;
+            if (--s_cruiseRemaining == 0) {
+                s_cruiseMode = false;
+            }
+        } else {
+            // Read from LUT, check for sentinels
+            nextInterval = s_lut[s_mbLutIndex];
+            s_mbLutIndex++;
+
+            if (nextInterval == 0) {
+                // Cruise sentinel: [0, interval, count_hi, count_lo]
+                s_cruiseInterval = s_lut[s_mbLutIndex++];
+                uint16_t countHi = s_lut[s_mbLutIndex++];
+                uint16_t countLo = s_lut[s_mbLutIndex++];
+                uint32_t cruiseCount = ((uint32_t)countHi << 16) | countLo;
+
+                if (cruiseCount > 1) {
+                    s_cruiseRemaining = cruiseCount - 1;
+                    s_cruiseMode = true;
+                }
+                nextInterval = s_cruiseInterval;
+            } else if (nextInterval == 1) {
+                // Accel sentinel: [1, v_hi, v_lo, a_hi, a_lo, count_hi, count_lo]
+                uint16_t vHi = s_lut[s_mbLutIndex++];
+                uint16_t vLo = s_lut[s_mbLutIndex++];
+                uint16_t aHi = s_lut[s_mbLutIndex++];
+                uint16_t aLo = s_lut[s_mbLutIndex++];
+                uint16_t countHi = s_lut[s_mbLutIndex++];
+                uint16_t countLo = s_lut[s_mbLutIndex++];
+
+                s_accelVelocity = ((uint32_t)vHi << 16) | vLo;
+                s_accelRate = (int32_t)(((uint32_t)aHi << 16) | aLo);
+                uint32_t accelCount = ((uint32_t)countHi << 16) | countLo;
+
+                // First step uses initial velocity
+                uint16_t vel16 = (uint16_t)(s_accelVelocity >> 16);
+                nextInterval = (vel16 > 0) ? (uint16_t)((uint32_t)F_CPU / vel16) : 65535;
+
+                if (accelCount > 1) {
+                    s_accelRemaining = accelCount - 1;
+                    s_accelMode = true;
+                }
+            }
+        }
+    } else {
+        // Single-move circular double-buffer read
+        nextInterval = s_lut[s_lutIndex];
+        s_lutIndex++;
+
+        if (s_lutIndex == LUT_HALF_SIZE && s_firstHalfActive) {
+            s_firstHalfActive = false;
+            if (!s_lutExhausted) s_needRefill = true;
+        } else if (s_lutIndex == LUT_TOTAL_SIZE) {
+            s_lutIndex = 0;
+            s_firstHalfActive = true;
+            if (!s_lutExhausted) s_needRefill = true;
+        }
     }
 
-    // 4. Handle prescaler switching.
-    // LUT values are always computed for 16 MHz (prescaler=1).
-    // When using prescaler=8, the timer ticks at 2 MHz, so we must
-    // divide the LUT value by 8 before writing to OCR3A.
+    // 4. Handle prescaler switching
     if (s_usingPrescaler8) {
         if (nextInterval < (65535 / 8)) {
-            // Speed high enough to use prescaler=1 — switch back
             TCCR3B = (1 << WGM32) | (1 << CS30);
             s_usingPrescaler8 = false;
-            // nextInterval is already correct for 16 MHz
         } else {
-            // Stay on prescaler=8 — convert 16 MHz value to 2 MHz
             nextInterval >>= 3;
             if (nextInterval < 1) nextInterval = 1;
         }
     } else {
         if (nextInterval >= 65535) {
-            // Speed too low for prescaler=1 — switch to prescaler=8
             TCCR3B = (1 << WGM32) | (1 << CS31);
             s_usingPrescaler8 = true;
             nextInterval >>= 3;
@@ -307,12 +643,12 @@ ISR(TIMER3_COMPA_vect) {
 
     OCR3A = nextInterval;
 
-    // 5. Schedule STEP LOW via CompB after minimum pulse width
+    // 5. Schedule STEP LOW via CompB
     OCR3B = TCNT3 + PULSE_TICKS;
     TIMSK3 |= (1 << OCIE3B);
 
-    // 6. Check if move is complete
-    if (s_stepsRemaining <= 0) {
+    // 6. Check if move is complete (single-move mode only)
+    if (!s_multiBlockMode && s_stepsRemaining <= 0) {
         s_moveActive = false;
         TIMSK3 &= ~(1 << OCIE3A);
     }
@@ -320,16 +656,13 @@ ISR(TIMER3_COMPA_vect) {
 
 // ===== Timer3 CompB ISR: Drive STEP pins LOW =====
 ISR(TIMER3_COMPB_vect) {
-    // Drive dominant STEP LOW
     *s_domStepPort &= ~s_domStepMask;
 
-    // Drive minor STEP LOW if it was pulsed
     if (s_minStepPendingLow) {
         *s_minStepPort &= ~s_minStepMask;
         s_minStepPendingLow = false;
     }
 
-    // Disable CompB until next step
     TIMSK3 &= ~(1 << OCIE3B);
 }
 

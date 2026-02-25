@@ -1,4 +1,10 @@
 // motion_commander.cpp - Move command dispatcher
+//
+// Streaming dispatch: MOVE_TO/MOVE_RELATIVE are fed into the trajectory
+// planner via queueMove() with backpressure (waits when planner buffer full).
+// Non-motion commands (HOME, STOP, SET_POSITION, ENABLE, DISABLE) flush
+// all queued motion first, then execute.
+
 #include "motion_commander.h"
 #include <math.h>
 
@@ -7,86 +13,93 @@ MotionCommander::MotionCommander(
     Motion& motion)
     : m_moveBuffer(moveBuffer)
     , m_motion(motion)
+    , m_hasPending(false)
 {}
 
 bool MotionCommander::run() {
-    if (m_moveBuffer.isEmpty()) return false;
-    if (!m_motion.isMovementComplete()) return false;
+    // Grab the next command if we don't have one pending
+    if (!m_hasPending) {
+        if (m_moveBuffer.isEmpty()) {
+            // No more commands — flush any buffered planner moves
+            m_motion.endProgram();
+            return false;
+        }
+        m_moveBuffer.dequeue(m_pending);
+        m_hasPending = true;
+    }
 
-    MoveCommand cmd;
-    m_moveBuffer.dequeue(cmd);
-    dispatch(cmd);
-    return true;
+    // Try to dispatch the pending command
+    if (tryDispatch(m_pending)) {
+        m_hasPending = false;
+        return true;
+    }
+
+    return false;
 }
 
-void MotionCommander::dispatch(const MoveCommand& cmd) {
+bool MotionCommander::tryDispatch(const MoveCommand& cmd) {
     switch (cmd.type) {
         case MOVE_TO: {
             if (!m_motion.isPositionKnown()) {
                 Serial.println(F("error: Cannot move to absolute position before homing or G92"));
-                break;
+                return true;  // consumed (error), don't retry
             }
+            if (m_motion.isPlannerFull()) return false;  // backpressure
+
             float r = isnan(cmd.radius) ? m_motion.getRadiusMM() : cmd.radius;
             float a = isnan(cmd.theta) ? m_motion.getThetaDegrees() : cmd.theta;
-            Serial.print(F("[CMD] MOVE_TO R="));
-            Serial.print(r, 2);
-            Serial.print(F(" A="));
-            Serial.print(a, 2);
-            Serial.print(F(" F="));
-            Serial.println(m_motion.getFeedrate(), 1);
-            m_motion.moveTo(r, a);
-            break;
+            m_motion.queueMove(r, a, true);
+            return true;
         }
-        case MOVE_RELATIVE:
-            Serial.print(F("[CMD] MOVE_REL dR="));
-            Serial.print(cmd.radius, 2);
-            Serial.print(F(" dA="));
-            Serial.println(cmd.theta, 2);
-            m_motion.moveRelative(cmd.radius, cmd.theta);
-            break;
 
-        case MOVE_HOME:
-            Serial.println(F("[CMD] HOME"));
-            m_motion.home();
-            break;
+        case MOVE_RELATIVE: {
+            if (m_motion.isPlannerFull()) return false;  // backpressure
 
-        case MOVE_STOP:
-            Serial.println(F("[CMD] STOP"));
-            m_motion.disableMotors(true, true);
-            break;
-
-        case MOVE_SET_POSITION: {
-            if (!m_motion.isPositionKnown() && (isnan(cmd.radius) || isnan(cmd.theta))) {
-                Serial.println(F("error: G92 requires both R and A before position is known"));
-                break;
-            }
-            float r = isnan(cmd.radius) ? m_motion.getRadiusMM() : cmd.radius;
-            float a = isnan(cmd.theta) ? m_motion.getThetaDegrees() : cmd.theta;
-            Serial.print(F("[CMD] SET_POS R="));
-            Serial.print(r, 2);
-            Serial.print(F(" A="));
-            Serial.println(a, 2);
-            m_motion.setPosition(r, a);
-            break;
+            float dr = isnan(cmd.radius) ? 0.0f : cmd.radius;
+            float da = isnan(cmd.theta) ? 0.0f : cmd.theta;
+            m_motion.queueMove(dr, da, false);
+            return true;
         }
 
         case MOVE_SET_SPEED:
-            Serial.print(F("[CMD] SET_SPEED F="));
-            Serial.println(cmd.radius, 1);
             m_motion.setFeedrate(cmd.radius);
-            break;
+            return true;
 
-        case MOVE_NONE:
-            break;
+        // Non-motion commands: flush planner first
+        case MOVE_HOME:
+            if (!m_motion.isMovementComplete()) return false;
+            m_motion.home();
+            return true;
+
+        case MOVE_STOP:
+            if (!m_motion.isMovementComplete()) return false;
+            m_motion.disableMotors(true, true);
+            return true;
+
+        case MOVE_SET_POSITION: {
+            if (!m_motion.isMovementComplete()) return false;
+            if (!m_motion.isPositionKnown() && (isnan(cmd.radius) || isnan(cmd.theta))) {
+                Serial.println(F("error: G92 requires both R and A before position is known"));
+                return true;
+            }
+            float r = isnan(cmd.radius) ? m_motion.getRadiusMM() : cmd.radius;
+            float a = isnan(cmd.theta) ? m_motion.getThetaDegrees() : cmd.theta;
+            m_motion.setPosition(r, a);
+            return true;
+        }
 
         case MOVE_ENABLE:
-            Serial.println(F("[CMD] ENABLE"));
+            if (!m_motion.isMovementComplete()) return false;
             m_motion.enableMotors(cmd.radius > 0, cmd.theta > 0);
-            break;
+            return true;
 
         case MOVE_DISABLE:
-            Serial.println(F("[CMD] DISABLE"));
+            if (!m_motion.isMovementComplete()) return false;
             m_motion.disableMotors(cmd.radius > 0, cmd.theta > 0);
-            break;
+            return true;
+
+        case MOVE_NONE:
+            return true;
     }
+    return true;
 }

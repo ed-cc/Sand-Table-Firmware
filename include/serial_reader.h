@@ -5,8 +5,8 @@
 #include <Arduino.h>
 #include "ring_buffer.h"
 
-#define GCODE_LINE_MAX_LENGTH 96
-#define GCODE_BUFFER_CAPACITY 16
+#define GCODE_LINE_MAX_LENGTH 64
+#define GCODE_BUFFER_CAPACITY 8
 
 struct GCodeLine {
     char line[GCODE_LINE_MAX_LENGTH];

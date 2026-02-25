@@ -20,6 +20,8 @@ Motion::Motion()
     , m_isHoming(false)
     , m_positionKnown(false)
     , m_feedrate(1000.0f)  // Default 1000 mm/min
+    , m_plannerTargetR(0.0f)
+    , m_plannerTargetTheta(0.0f)
 {
 }
 
@@ -58,6 +60,9 @@ void Motion::setupSteppers() {
     // Initialise hardware timers
     timerBackendInit();
 
+    // Initialise trajectory planner with axis pointers
+    m_planner.init(&m_stepper.thetaAxis(), &m_stepper.radiusAxis());
+
     // Start with motors disabled
     disableMotors();
 
@@ -67,6 +72,33 @@ void Motion::setupSteppers() {
     Serial.print(F("mA, Theta "));
     Serial.print(THETA_MOTOR_CURRENT);
     Serial.println(F("mA"));
+
+#ifdef DEBUG
+    // Read back actual microstep config from drivers to verify UART took effect
+    uint16_t rMicro = m_radiusDriver->microsteps();
+    uint16_t tMicro = m_thetaDriver->microsteps();
+    Serial.print(F("[DBG] Radius microsteps readback: "));
+    Serial.println(rMicro);
+    Serial.print(F("[DBG] Theta microsteps readback: "));
+    Serial.println(tMicro);
+    Serial.print(F("[DBG] Expected microsteps: "));
+    Serial.println(MICROSTEPS);
+    if (rMicro != MICROSTEPS || tMicro != MICROSTEPS) {
+        Serial.println(F("[DBG] WARNING: Microstep mismatch! UART config may have failed."));
+    }
+
+    // Print key constants for verification
+    Serial.print(F("[DBG] THETA_STEPS_PER_DEGREE="));
+    Serial.println(THETA_STEPS_PER_DEGREE, 4);
+    Serial.print(F("[DBG] THETA_DRIVE_RATIO="));
+    Serial.println(THETA_DRIVE_RATIO, 4);
+    Serial.print(F("[DBG] RADIUS_STEPS_PER_MM="));
+    Serial.println(RADIUS_STEPS_PER_MM, 4);
+    Serial.print(F("[DBG] RADIUS_CENTRE_STEPS_PER_DEGREE="));
+    Serial.println(RADIUS_CENTRE_STEPS_PER_DEGREE, 4);
+    Serial.print(F("[DBG] RADIUS_COMPENSATION_PER_THETA_STEP="));
+    Serial.println(RADIUS_COMPENSATION_PER_THETA_STEP, 6);
+#endif
 }
 
 void Motion::home() {
@@ -141,6 +173,54 @@ void Motion::moveRelative(float radiusMM, float thetaDegrees) {
     timerBackendStartMove(m_stepper);
 }
 
+void Motion::queueMove(float radiusMM, float thetaDegrees, bool absolute) {
+    enableMotors();
+
+    float deltaR, deltaTheta;
+
+    if (absolute) {
+        // Clamp target radius
+        if (radiusMM < RADIUS_MIN_MM) radiusMM = RADIUS_MIN_MM;
+        if (radiusMM > RADIUS_MAX_MM) radiusMM = RADIUS_MAX_MM;
+
+        deltaR = radiusMM - m_plannerTargetR;
+        deltaTheta = thetaDegrees - m_plannerTargetTheta;
+
+        m_plannerTargetR = radiusMM;
+        m_plannerTargetTheta = thetaDegrees;
+    } else {
+        // Relative: clamp resulting radius
+        float targetR = m_plannerTargetR + radiusMM;
+        if (targetR < RADIUS_MIN_MM) targetR = RADIUS_MIN_MM;
+        if (targetR > RADIUS_MAX_MM) targetR = RADIUS_MAX_MM;
+
+        deltaR = targetR - m_plannerTargetR;
+        deltaTheta = thetaDegrees;
+
+        m_plannerTargetR = targetR;
+        m_plannerTargetTheta += thetaDegrees;
+    }
+
+    float feed_mmps = m_feedrate / 60.0f;
+
+    m_planner.queue_move(deltaR, deltaTheta, feed_mmps, m_plannerTargetR - deltaR);
+}
+
+void Motion::flushMoves() {
+    m_planner.end_of_program();
+    while (!m_planner.is_idle()) {
+        m_planner.run();
+    }
+}
+
+void Motion::endProgram() {
+    m_planner.end_of_program();
+}
+
+bool Motion::isPlannerFull() const {
+    return m_planner.buffer_full();
+}
+
 void Motion::run() {
     // Homing state machine
     if (m_isHoming) {
@@ -151,6 +231,8 @@ void Motion::run() {
             m_isHoming = false;
             if (m_homingManager.isComplete()) {
                 m_positionKnown = true;
+                m_plannerTargetR = getRadiusMM();
+                m_plannerTargetTheta = getThetaDegrees();
                 Serial.println(F("Homing complete"));
             } else {
                 Serial.println(F("Homing failed"));
@@ -159,7 +241,10 @@ void Motion::run() {
         return;
     }
 
-    // Normal operation: refill LUT for ISR-driven stepping
+    // Trajectory planner state management
+    m_planner.run();
+
+    // Normal operation: refill LUT for ISR-driven single-move stepping
     if (!timerBackendIsComplete()) {
         timerBackendRefillLUT(m_stepper);
 
@@ -183,7 +268,7 @@ void Motion::run() {
 
 bool Motion::isMovementComplete() {
     if (m_isHoming) return false;
-    return m_stepper.isComplete() && timerBackendIsComplete();
+    return m_stepper.isComplete() && timerBackendIsComplete() && m_planner.is_idle();
 }
 
 void Motion::enableMotors(bool radius, bool theta) {
@@ -215,7 +300,21 @@ void Motion::setPosition(float radiusMM, float thetaDegrees) {
     Serial.print(F(" A="));
     Serial.println(thetaDegrees, 2);
     m_stepper.setPosition(radiusMM, thetaDegrees);
+    m_plannerTargetR = radiusMM;
+    m_plannerTargetTheta = thetaDegrees;
     m_positionKnown = true;
+}
+
+void Motion::feedHold() {
+    m_planner.feed_hold();
+}
+
+void Motion::resume() {
+    m_planner.resume();
+}
+
+void Motion::abort() {
+    m_planner.abort();
 }
 
 void Motion::printDriverStatus() {

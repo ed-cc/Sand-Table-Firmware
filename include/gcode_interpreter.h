@@ -12,7 +12,12 @@
 #include "move_command.h"
 #include "serial_reader.h"
 
-#define MOVE_BUFFER_CAPACITY 32
+// Callback type for M98 subprogram calls.
+// Parameters: program number (P), repetition count (L).
+// Returns true if the subprogram was found and started.
+typedef bool (*SubprogramCallback)(uint8_t programNumber, uint16_t repetitions);
+
+#define MOVE_BUFFER_CAPACITY 8
 #define MAX_GCODES_PER_LINE 3
 
 enum InterpreterState : uint8_t {
@@ -28,6 +33,9 @@ public:
         RingBuffer<MoveCommand, MOVE_BUFFER_CAPACITY>& moveBuffer,
         StatusCallback onStatusQuery);
 
+    // Set callback for M98 subprogram calls
+    void setSubprogramCallback(SubprogramCallback cb) { m_onSubprogramCall = cb; }
+
     // Call every event loop iteration. Advances interpretation by one step:
     //   IDLE    → dequeue a line, strip comments, reset parse state
     //   PARSING → parse one letter+number token (one strtod at most)
@@ -39,6 +47,7 @@ private:
     RingBuffer<GCodeLine, GCODE_BUFFER_CAPACITY>& m_gcodeBuffer;
     RingBuffer<MoveCommand, MOVE_BUFFER_CAPACITY>& m_moveBuffer;
     StatusCallback m_onStatusQuery;
+    SubprogramCallback m_onSubprogramCall;
 
     // Modal state (persists across lines)
     bool m_absoluteMode;
@@ -57,7 +66,9 @@ private:
     uint8_t m_gCount;
     int8_t m_mCode;
     float m_rVal, m_aVal, m_fVal;
+    float m_pVal, m_lVal;
     bool m_hasR, m_hasA;
+    bool m_hasP, m_hasL;
 
     void beginLine();
     void parseNextToken();

@@ -81,6 +81,35 @@ public:
     // Returns number of entries written.
     int32_t computeIntervalBlock(int32_t startStep, uint16_t* lut, int32_t count, uint32_t tickFreq) const;
 
+    // Pre-compute a compressed LUT for multi-block trajectory planning.
+    // Compresses the cruise phase (phase 4) into a 4-entry sentinel [0, interval, count_hi, count_lo]
+    // instead of storing thousands of identical intervals. Other phases stored per-step as normal.
+    // lut:        output array (caller-allocated)
+    // maxEntries: size of lut array
+    // tickFreq:   timer frequency in Hz
+    // Returns number of compressed LUT entries written.
+    int32_t precomputeCompressedLUT(uint16_t* lut, int32_t maxEntries, uint32_t tickFreq) const;
+
+    // Return the number of LUT entries needed in compressed format.
+    // Compresses cruise (phase 3) and constant-accel/decel (phases 1, 5)
+    // into sentinels, so far fewer entries than totalSteps().
+    // Used for overflow checking before pre-computation.
+    int32_t lutEntryCount() const;
+
+    // Phase boundary info for compressed LUT planning.
+    struct PhaseBoundaries {
+        int32_t jerk0Steps;       // steps in phase 0 (jerk up)
+        int32_t constAccelSteps;  // steps in phase 1 (constant accel)
+        int32_t jerk2Steps;       // steps in phase 2 (jerk down)
+        int32_t cruiseSteps;      // steps in phase 3 (cruise)
+        int32_t jerk4Steps;       // steps in phase 4 (jerk down, decel start)
+        int32_t constDecelSteps;  // steps in phase 5 (constant decel)
+        int32_t jerk6Steps;       // steps in phase 6 (jerk up, decel end)
+    };
+
+    // Compute step counts for each of the 7 phases.
+    void phaseBoundaries(PhaseBoundaries& out) const;
+
     // Total planned steps
     int32_t totalSteps() const { return m_totalSteps; }
 

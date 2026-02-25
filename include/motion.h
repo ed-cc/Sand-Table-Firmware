@@ -18,6 +18,7 @@
 #include "values.h"
 #include "coordinated_stepper.h"
 #include "homing_manager.h"
+#include "trajectory_planner.h"
 
 class Motion
 {
@@ -63,12 +64,22 @@ public:
     void setFeedrate(float feedrate) { m_feedrate = feedrate; }
     float getFeedrate() const { return m_feedrate; }
 
+    // Lookahead planner API
+    void queueMove(float radiusMM, float thetaDegrees, bool absolute);
+    void flushMoves();
+    void endProgram();
+    bool isPlannerFull() const;
+    void feedHold();
+    void resume();
+    void abort();
+
     // Print driver status for debugging
     void printDriverStatus();
 
 private:
-    CoordinatedStepper m_stepper;
-    HomingManager      m_homingManager;
+    CoordinatedStepper  m_stepper;
+    HomingManager       m_homingManager;
+    TrajectoryPlanner   m_planner;
 
     TMC2208Stepper*    m_radiusDriver;
     TMC2208Stepper*    m_thetaDriver;
@@ -76,6 +87,10 @@ private:
     bool  m_isHoming;
     bool  m_positionKnown;
     float m_feedrate;       // mm/min
+
+    // Planner target position — tracks commanded position ahead of actual
+    float m_plannerTargetR;     // mm
+    float m_plannerTargetTheta; // degrees
 };
 
 #endif // MOTION_H

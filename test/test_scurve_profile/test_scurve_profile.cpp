@@ -234,6 +234,261 @@ void test_typical_theta_move() {
     TEST_ASSERT_TRUE(prof.totalTime() > 0);
 }
 
+// ===== Compressed LUT Tests =====
+
+void test_lut_entry_count_is_compressed_for_long_move() {
+    // Test the new compression API: lutEntryCount() should return
+    // a much smaller count than totalSteps() for moves with long cruise phase.
+    // Use system-realistic parameters for sand table: fast accel/jerk, slow speed
+    SCurveProfile prof;
+    // Large move (15000 steps) with system parameters:
+    // maxVel=2083 (16.67mm/s at 125 steps/mm), high accel/jerk
+    prof.plan(15000, 2083, 10000, 100000);
+
+    TEST_ASSERT_EQUAL_INT32(15000, prof.totalSteps());
+
+    // lutEntryCount() should be much smaller due to cruise compression
+    int32_t compressedCount = prof.lutEntryCount();
+    // With system parameters: ~150 accel + 4 cruise + ~150 decel = ~300 entries
+    TEST_ASSERT_TRUE(compressedCount < prof.totalSteps());
+    TEST_ASSERT_TRUE(compressedCount < 1400);  // Must fit in AVR_MAX_PRECOMPUTE_STEPS
+}
+
+void test_compressed_lut_smaller_than_step_count() {
+    // Test precomputeCompressedLUT() returns fewer entries than totalSteps()
+    // Use system-realistic parameters (fast accel/jerk)
+    SCurveProfile prof;
+    prof.plan(15000, 2083, 10000, 100000);  // system defaults: high accel/jerk, slower speed
+
+    uint16_t lut[2000];
+    int32_t compressedEntries = prof.precomputeCompressedLUT(lut, 2000, 16000000);
+
+    // Compressed format should have far fewer entries than 15000 steps
+    TEST_ASSERT_TRUE(compressedEntries < 15000);
+    // With system params, should be ~300 entries vs 15000 steps
+    TEST_ASSERT_TRUE(compressedEntries < 1000);  // Dramatic compression
+    TEST_ASSERT_EQUAL_INT32(compressedEntries, prof.lutEntryCount());
+}
+
+void test_compressed_lut_cruise_header_has_correct_count() {
+    // Test that the compressed LUT contains a cruise sentinel (0 value)
+    // and the header has proper structure. Must skip over accel sentinels.
+    SCurveProfile prof;
+    prof.plan(15000, 2000, 1500, 15000);
+
+    uint16_t lut[2000];
+    int32_t compressedEntries = prof.precomputeCompressedLUT(lut, 2000, 16000000);
+
+    // Find the cruise sentinel (value 0), skipping over accel sentinel data
+    int32_t sentinelPos = -1;
+    int32_t i = 0;
+    while (i < compressedEntries) {
+        if (lut[i] == 0) {
+            sentinelPos = i;
+            break;
+        } else if (lut[i] == 1) {
+            i += 7;  // skip accel sentinel header
+        } else {
+            i++;     // raw interval
+        }
+    }
+
+    // Should find a cruise sentinel
+    TEST_ASSERT_NOT_EQUAL(-1, sentinelPos);
+    TEST_ASSERT_TRUE(sentinelPos > 0);  // not at the very start
+
+    // After sentinel, next three entries should be: cruise_interval, count_hi, count_lo
+    TEST_ASSERT_TRUE(sentinelPos + 3 < compressedEntries);
+    uint16_t cruiseInterval = lut[sentinelPos + 1];
+    uint16_t countHi = lut[sentinelPos + 2];
+    uint16_t countLo = lut[sentinelPos + 3];
+
+    // Cruise interval should be non-zero
+    TEST_ASSERT_TRUE(cruiseInterval > 0);
+
+    // Reconstruct cruise step count
+    uint32_t cruiseCount = ((uint32_t)countHi << 16) | countLo;
+
+    // Cruise count should be reasonable (positive, large for this move)
+    TEST_ASSERT_TRUE(cruiseCount > 0);
+    TEST_ASSERT_TRUE(cruiseCount < 15000);
+}
+
+// ===== Phase Boundaries Tests =====
+
+void test_phase_boundaries_sum_equals_total_steps() {
+    SCurveProfile prof;
+    prof.plan(50000, 2000, 1500, 15000);
+
+    SCurveProfile::PhaseBoundaries pb;
+    prof.phaseBoundaries(pb);
+
+    int32_t sum = pb.jerk0Steps + pb.constAccelSteps + pb.jerk2Steps
+                + pb.cruiseSteps + pb.jerk4Steps + pb.constDecelSteps + pb.jerk6Steps;
+    // Allow rounding tolerance of ±1
+    TEST_ASSERT_INT32_WITHIN(1, prof.totalSteps(), sum);
+}
+
+void test_phase_boundaries_long_move_has_const_accel() {
+    SCurveProfile prof;
+    prof.plan(50000, 2000, 1500, 15000);
+
+    SCurveProfile::PhaseBoundaries pb;
+    prof.phaseBoundaries(pb);
+
+    TEST_ASSERT_TRUE(pb.constAccelSteps > 0);
+    TEST_ASSERT_TRUE(pb.constDecelSteps > 0);
+    TEST_ASSERT_TRUE(pb.cruiseSteps > 0);
+}
+
+void test_phase_boundaries_short_move_no_const_accel() {
+    SCurveProfile prof;
+    // Very short move: triangular profile, no const-accel or cruise
+    prof.plan(10, 2000, 1500, 15000);
+
+    SCurveProfile::PhaseBoundaries pb;
+    prof.phaseBoundaries(pb);
+
+    // For such a short move, const accel and cruise should be 0
+    TEST_ASSERT_EQUAL_INT32(0, pb.constAccelSteps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.cruiseSteps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.constDecelSteps);
+}
+
+void test_phase_boundaries_zero_steps() {
+    SCurveProfile prof;
+    prof.plan(0, 2000, 1500, 15000);
+
+    SCurveProfile::PhaseBoundaries pb;
+    prof.phaseBoundaries(pb);
+
+    TEST_ASSERT_EQUAL_INT32(0, pb.jerk0Steps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.constAccelSteps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.jerk2Steps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.cruiseSteps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.jerk4Steps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.constDecelSteps);
+    TEST_ASSERT_EQUAL_INT32(0, pb.jerk6Steps);
+}
+
+void test_phase_boundaries_consistent_with_lut_entry_count() {
+    SCurveProfile prof;
+    prof.plan(15000, 2083, 10000, 100000);
+
+    SCurveProfile::PhaseBoundaries pb;
+    prof.phaseBoundaries(pb);
+    int32_t lutCount = prof.lutEntryCount();
+
+    // Manual expected count from boundaries
+    int32_t expected = pb.jerk0Steps
+                     + (pb.constAccelSteps > 0 ? 7 : 0)
+                     + pb.jerk2Steps
+                     + (pb.cruiseSteps > 0 ? 4 : 0)
+                     + pb.jerk4Steps
+                     + (pb.constDecelSteps > 0 ? 7 : 0)
+                     + pb.jerk6Steps;
+
+    TEST_ASSERT_EQUAL_INT32(expected, lutCount);
+}
+
+// ===== Accel Sentinel Tests =====
+
+void test_compressed_lut_contains_accel_sentinel() {
+    // A long move with const-accel phases should contain sentinel value 1
+    SCurveProfile prof;
+    prof.plan(50000, 2000, 1500, 15000);
+
+    SCurveProfile::PhaseBoundaries pb;
+    prof.phaseBoundaries(pb);
+
+    // Ensure const-accel phases exist
+    TEST_ASSERT_TRUE(pb.constAccelSteps > 0);
+
+    uint16_t lut[2000];
+    int32_t entries = prof.precomputeCompressedLUT(lut, 2000, 16000000);
+
+    // Find accel sentinel (value 1)
+    int32_t accelSentinelPos = -1;
+    for (int32_t i = 0; i < entries; i++) {
+        if (lut[i] == 1) {
+            accelSentinelPos = i;
+            break;
+        }
+    }
+    TEST_ASSERT_NOT_EQUAL(-1, accelSentinelPos);
+    TEST_ASSERT_TRUE(accelSentinelPos + 6 < entries);  // room for 7-entry header
+}
+
+void test_accel_sentinel_velocity_matches_profile() {
+    SCurveProfile prof;
+    prof.plan(50000, 2000, 1500, 15000);
+
+    uint16_t lut[2000];
+    int32_t entries = prof.precomputeCompressedLUT(lut, 2000, 16000000);
+
+    // Find first accel sentinel
+    for (int32_t i = 0; i < entries; i++) {
+        if (lut[i] == 1) {
+            // Extract velocity from sentinel
+            uint32_t v_fixed = ((uint32_t)lut[i+1] << 16) | lut[i+2];
+            float v_from_sentinel = (float)v_fixed / 65536.0f;
+
+            // Should match V[1] (phase 1 start velocity)
+            float v_expected = prof.velocityAt(prof.phaseStartTime(1) + 0.0001f);
+            // Allow 5% tolerance due to fixed-point rounding
+            float diff = fabsf(v_from_sentinel - v_expected);
+            TEST_ASSERT_TRUE(diff / v_expected < 0.05f);
+            break;
+        }
+    }
+}
+
+void test_compressed_lut_total_steps_correct() {
+    // Verify that the sum of all sentinel counts + raw entries equals totalSteps
+    SCurveProfile prof;
+    prof.plan(15000, 2000, 1500, 15000);
+
+    uint16_t lut[2000];
+    int32_t entries = prof.precomputeCompressedLUT(lut, 2000, 16000000);
+
+    int32_t totalStepsFromLut = 0;
+    int32_t i = 0;
+    while (i < entries) {
+        if (lut[i] == 0) {
+            // Cruise sentinel: [0, interval, count_hi, count_lo]
+            uint32_t count = ((uint32_t)lut[i+2] << 16) | lut[i+3];
+            totalStepsFromLut += (int32_t)count;
+            i += 4;
+        } else if (lut[i] == 1) {
+            // Accel sentinel: [1, v_hi, v_lo, a_hi, a_lo, count_hi, count_lo]
+            uint32_t count = ((uint32_t)lut[i+5] << 16) | lut[i+6];
+            totalStepsFromLut += (int32_t)count;
+            i += 7;
+        } else {
+            // Raw interval: one step
+            totalStepsFromLut++;
+            i++;
+        }
+    }
+
+    // Allow ±1 for rounding
+    TEST_ASSERT_INT32_WITHIN(1, prof.totalSteps(), totalStepsFromLut);
+}
+
+void test_lut_entry_count_much_smaller_with_accel_sentinels() {
+    // With theta-like parameters that produce large const-accel phases,
+    // the new compression should be dramatically smaller
+    SCurveProfile prof;
+    prof.plan(5250, 2000, 1500, 15000);  // typical 45-degree theta move
+
+    int32_t compressed = prof.lutEntryCount();
+
+    // With accel sentinels, should be well under 1400 (AVR_MAX_PRECOMPUTE_STEPS)
+    TEST_ASSERT_TRUE(compressed < 1400);
+    // Should be dramatically less than total steps
+    TEST_ASSERT_TRUE(compressed < prof.totalSteps() / 2);
+}
+
 // ===== Test Runner =====
 
 int main(int argc, char** argv) {
@@ -253,5 +508,17 @@ int main(int argc, char** argv) {
     RUN_TEST(test_symmetric_profile);
     RUN_TEST(test_typical_radius_move);
     RUN_TEST(test_typical_theta_move);
+    RUN_TEST(test_lut_entry_count_is_compressed_for_long_move);
+    RUN_TEST(test_compressed_lut_smaller_than_step_count);
+    RUN_TEST(test_compressed_lut_cruise_header_has_correct_count);
+    RUN_TEST(test_phase_boundaries_sum_equals_total_steps);
+    RUN_TEST(test_phase_boundaries_long_move_has_const_accel);
+    RUN_TEST(test_phase_boundaries_short_move_no_const_accel);
+    RUN_TEST(test_phase_boundaries_zero_steps);
+    RUN_TEST(test_phase_boundaries_consistent_with_lut_entry_count);
+    RUN_TEST(test_compressed_lut_contains_accel_sentinel);
+    RUN_TEST(test_accel_sentinel_velocity_matches_profile);
+    RUN_TEST(test_compressed_lut_total_steps_correct);
+    RUN_TEST(test_lut_entry_count_much_smaller_with_accel_sentinels);
     return UNITY_END();
 }

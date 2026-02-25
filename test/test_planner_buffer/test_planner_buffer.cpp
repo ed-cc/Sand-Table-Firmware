@@ -46,9 +46,10 @@ static PlannerBlock make_block(float delta_r_mm, float delta_theta_deg,
     blk.R_start_mm = R_start_mm;
 
     float arc_mm = 0.0f;
-    if (R_start_mm >= PLANNER_R_MIN_MM) {
+    float absR = R_start_mm < 0.0f ? -R_start_mm : R_start_mm;
+    if (absR >= PLANNER_R_MIN_MM) {
         float delta_theta_rad = delta_theta_deg * (float)M_PI / 180.0f;
-        arc_mm = R_start_mm * delta_theta_rad;
+        arc_mm = absR * delta_theta_rad;
     }
     blk.phys_distance_mm = sqrtf(delta_r_mm * delta_r_mm + arc_mm * arc_mm);
     if (blk.phys_distance_mm > 0.001f) {
@@ -234,18 +235,19 @@ void test_push_single_block() {
 }
 
 void test_push_two_collinear_merge() {
-    // Two collinear same-speed blocks should merge into one
+    // Two collinear same-speed blocks should merge into one.
+    // 5mm each = 625 steps each. 2x625 = 1250 < AVR_MAX_PRECOMPUTE_STEPS (1400).
     PlannerBuffer buf;
     buf.init(DEFAULT_PHYS_ACCEL_MMPS2);
 
-    buf.push(10.0f, 0.0f, 50.0f, 50.0f);
-    buf.push(10.0f, 0.0f, 50.0f, 60.0f);
+    buf.push(5.0f, 0.0f, 50.0f, 50.0f);
+    buf.push(5.0f, 0.0f, 50.0f, 55.0f);
 
     // Collinear + same feed rate -> merged into 1 block
     TEST_ASSERT_EQUAL_UINT8(1, buf.count());
-    assertFloatNear(20.0f, buf.current()->delta_r_mm, 0.01f,
+    assertFloatNear(10.0f, buf.current()->delta_r_mm, 0.01f,
                     "push collinear merge: delta_r combined");
-    assertFloatNear(20.0f, buf.current()->phys_distance_mm, 0.01f,
+    assertFloatNear(10.0f, buf.current()->phys_distance_mm, 0.01f,
                     "push collinear merge: phys_distance combined");
 }
 
@@ -294,19 +296,19 @@ void test_push_dir_change_caps_speed() {
 
 void test_case_G_collinear_merge() {
     // Three small collinear moves that fit within LUT limit should merge.
-    // 5mm radius = 625 steps each. 3x625 = 1875 < AVR_MAX_PRECOMPUTE_STEPS (3000)
+    // 3mm radius = 375 steps each. 3x375 = 1125 < AVR_MAX_PRECOMPUTE_STEPS (1400).
     PlannerBuffer buf;
     buf.init(DEFAULT_PHYS_ACCEL_MMPS2);
 
-    buf.push(5.0f, 0.0f, 50.0f, 50.0f);
-    buf.push(5.0f, 0.0f, 50.0f, 55.0f);
-    buf.push(5.0f, 0.0f, 50.0f, 60.0f);
+    buf.push(3.0f, 0.0f, 50.0f, 50.0f);
+    buf.push(3.0f, 0.0f, 50.0f, 53.0f);
+    buf.push(3.0f, 0.0f, 50.0f, 56.0f);
     buf.mark_terminal();
 
-    // All three should merge into a single 15mm block
+    // All three should merge into a single 9mm block
     TEST_ASSERT_EQUAL_UINT8(1, buf.count());
-    assertFloatNear(15.0f, buf.current()->delta_r_mm, 0.01f,
-                    "G: merged delta_r = 15mm");
+    assertFloatNear(9.0f, buf.current()->delta_r_mm, 0.01f,
+                    "G: merged delta_r = 9mm");
     assertFloatNear(0.0f, buf.current()->entry_speed_mmps, 0.01f,
                     "G: merged entry = 0 (start from rest)");
     assertFloatNear(0.0f, buf.current()->exit_speed_mmps, 0.01f,
@@ -314,20 +316,20 @@ void test_case_G_collinear_merge() {
 }
 
 void test_collinear_merge_lut_overflow_guard() {
-    // Three 10mm radius moves = 3x1250 = 3750 steps > AVR_MAX_PRECOMPUTE_STEPS
-    // First two merge (2500 < 3000), third cannot merge (2500+1250=3750 > 3000)
+    // Three 5mm radius moves = 625 steps each.
+    // First two merge (1250 < 1400), third cannot (1250+625=1875 > 1400).
     PlannerBuffer buf;
     buf.init(DEFAULT_PHYS_ACCEL_MMPS2);
 
-    buf.push(10.0f, 0.0f, 50.0f, 50.0f);
-    buf.push(10.0f, 0.0f, 50.0f, 60.0f);
-    buf.push(10.0f, 0.0f, 50.0f, 70.0f);
+    buf.push(5.0f, 0.0f, 50.0f, 50.0f);
+    buf.push(5.0f, 0.0f, 50.0f, 55.0f);
+    buf.push(5.0f, 0.0f, 50.0f, 60.0f);
 
     TEST_ASSERT_EQUAL_UINT8(2, buf.count());
-    assertFloatNear(20.0f, buf.block_at(0).delta_r_mm, 0.01f,
-                    "LUT guard: first two merged to 20mm");
-    assertFloatNear(10.0f, buf.block_at(1).delta_r_mm, 0.01f,
-                    "LUT guard: third block stays at 10mm");
+    assertFloatNear(10.0f, buf.block_at(0).delta_r_mm, 0.01f,
+                    "LUT guard: first two merged to 10mm");
+    assertFloatNear(5.0f, buf.block_at(1).delta_r_mm, 0.01f,
+                    "LUT guard: third block stays at 5mm");
 }
 
 void test_case_G_lookahead_non_collinear() {
@@ -481,6 +483,49 @@ void test_mark_terminal() {
     assertFloatNear(0.0f, last.exit_speed_mmps, 0.01f, "terminal: exit = 0");
 }
 
+// ---------------------------------------------------------------------------
+// Negative R: physical vector and push must handle negative radius correctly
+// ---------------------------------------------------------------------------
+
+void test_phys_vector_negative_R_pure_theta() {
+    // Pure theta move at R = -100 mm.  The physical arc length should be
+    // |R| * |delta_theta_rad|, NOT zero.
+    PlannerBuffer buf;
+    buf.init(DEFAULT_PHYS_ACCEL_MMPS2);
+
+    buf.push(0.0f, 45.0f, 50.0f, -100.0f);
+
+    TEST_ASSERT_EQUAL_UINT8(1, buf.count());
+
+    const PlannerBlock* blk = buf.current();
+    TEST_ASSERT_NOT_NULL(blk);
+
+    // Expected: arc = |R| * theta_rad = 100 * (45 * pi/180) = 100 * 0.7854 = 78.54 mm
+    float expected_arc = 100.0f * 45.0f * (float)M_PI / 180.0f;
+    assertFloatNear(expected_arc, blk->phys_distance_mm, 0.1f,
+                    "neg R pure theta: phys_distance should be |R|*theta");
+
+    // steps_theta and steps_r_total must be non-zero (theta + compensation)
+    TEST_ASSERT_TRUE(blk->steps_theta != 0);
+    TEST_ASSERT_TRUE(blk->steps_r_total != 0);
+}
+
+void test_phys_vector_negative_R_combined() {
+    // Combined move at R = -50 mm: delta_r = 10 mm, delta_theta = 30 deg.
+    PlannerBuffer buf;
+    buf.init(DEFAULT_PHYS_ACCEL_MMPS2);
+
+    buf.push(10.0f, 30.0f, 50.0f, -50.0f);
+
+    TEST_ASSERT_EQUAL_UINT8(1, buf.count());
+
+    const PlannerBlock* blk = buf.current();
+    float arc = 50.0f * 30.0f * (float)M_PI / 180.0f;  // |R| * theta_rad
+    float expected = sqrtf(10.0f * 10.0f + arc * arc);
+    assertFloatNear(expected, blk->phys_distance_mm, 0.1f,
+                    "neg R combined: phys_distance uses |R|");
+}
+
 // ===== Test Runner =====
 
 int main(int argc, char** argv) {
@@ -512,6 +557,10 @@ int main(int argc, char** argv) {
     RUN_TEST(test_advance);
     RUN_TEST(test_clear);
     RUN_TEST(test_mark_terminal);
+
+    // Negative R handling
+    RUN_TEST(test_phys_vector_negative_R_pure_theta);
+    RUN_TEST(test_phys_vector_negative_R_combined);
 
     return UNITY_END();
 }

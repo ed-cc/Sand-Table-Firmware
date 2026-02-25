@@ -131,9 +131,12 @@ const PlannerBlock& PlannerBuffer::block_at(uint8_t logical_index) const {
 void PlannerBuffer::_compute_physical_vector(PlannerBlock& blk) {
     float arc_mm = 0.0f;
 
-    if (blk.R_start_mm >= PLANNER_R_MIN_MM) {
+    float absR = blk.R_start_mm;
+    if (absR < 0.0f) absR = -absR;
+
+    if (absR >= PLANNER_R_MIN_MM) {
         float delta_theta_rad = blk.delta_theta_deg * (float)M_PI / 180.0f;
-        arc_mm = blk.R_start_mm * delta_theta_rad;
+        arc_mm = absR * delta_theta_rad;
     }
     // else: R below minimum, arc treated as zero (force stop at junctions)
 

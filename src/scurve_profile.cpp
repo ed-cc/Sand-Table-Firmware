@@ -341,3 +341,225 @@ float SCurveProfile::phaseStartTime(uint8_t phase) const {
     if (phase >= 8) return m_totalTime;
     return m_B[phase];
 }
+
+void SCurveProfile::phaseBoundaries(PhaseBoundaries& out) const {
+    if (m_totalSteps <= 0) {
+        out = {0, 0, 0, 0, 0, 0, 0};
+        return;
+    }
+
+    // Cumulative step counts at each phase boundary
+    float d[8];
+    d[0] = 0.0f;
+    for (int i = 1; i <= 7; i++) {
+        d[i] = distanceAt(m_B[i]);
+    }
+    // Clamp final to totalSteps
+    d[7] = (float)m_totalSteps;
+
+    // Convert to integer step counts per phase
+    int32_t cumSteps[8];
+    cumSteps[0] = 0;
+    for (int i = 1; i < 7; i++) {
+        cumSteps[i] = (int32_t)(d[i] + 0.5f);
+    }
+    cumSteps[7] = m_totalSteps;
+
+    out.jerk0Steps      = cumSteps[1] - cumSteps[0];
+    out.constAccelSteps = cumSteps[2] - cumSteps[1];
+    out.jerk2Steps      = cumSteps[3] - cumSteps[2];
+    out.cruiseSteps     = cumSteps[4] - cumSteps[3];
+    out.jerk4Steps      = cumSteps[5] - cumSteps[4];
+    out.constDecelSteps = cumSteps[6] - cumSteps[5];
+    out.jerk6Steps      = cumSteps[7] - cumSteps[6];
+
+    // Clamp any negative values from rounding
+    if (out.jerk0Steps < 0) out.jerk0Steps = 0;
+    if (out.constAccelSteps < 0) out.constAccelSteps = 0;
+    if (out.jerk2Steps < 0) out.jerk2Steps = 0;
+    if (out.cruiseSteps < 0) out.cruiseSteps = 0;
+    if (out.jerk4Steps < 0) out.jerk4Steps = 0;
+    if (out.constDecelSteps < 0) out.constDecelSteps = 0;
+    if (out.jerk6Steps < 0) out.jerk6Steps = 0;
+}
+
+int32_t SCurveProfile::lutEntryCount() const {
+    // Return the compressed LUT entry count.
+    // Cruise phase (3): 4-entry sentinel [0, interval, count_hi, count_lo]
+    // Constant accel phase (1): 7-entry sentinel [1, v_hi, v_lo, a_hi, a_lo, count_hi, count_lo]
+    // Constant decel phase (5): 7-entry sentinel (same format)
+    // Jerk phases (0, 2, 4, 6): per-step raw intervals
+
+    if (m_totalSteps <= 0) return 0;
+
+    PhaseBoundaries pb;
+    phaseBoundaries(pb);
+
+    int32_t count = 0;
+
+    // Phase 0: jerk up - raw
+    count += pb.jerk0Steps;
+
+    // Phase 1: const accel - sentinel if steps > 0
+    count += (pb.constAccelSteps > 0) ? 7 : 0;
+
+    // Phase 2: jerk down - raw
+    count += pb.jerk2Steps;
+
+    // Phase 3: cruise - sentinel if steps > 0
+    count += (pb.cruiseSteps > 0) ? 4 : 0;
+
+    // Phase 4: jerk down (decel) - raw
+    count += pb.jerk4Steps;
+
+    // Phase 5: const decel - sentinel if steps > 0
+    count += (pb.constDecelSteps > 0) ? 7 : 0;
+
+    // Phase 6: jerk up (decel end) - raw
+    count += pb.jerk6Steps;
+
+    return count;
+}
+
+int32_t SCurveProfile::precomputeCompressedLUT(uint16_t* lut, int32_t maxEntries, uint32_t tickFreq) const {
+    if (maxEntries <= 0 || m_totalSteps <= 0) return 0;
+
+    PhaseBoundaries pb;
+    phaseBoundaries(pb);
+
+    int32_t cursor = 0;
+    int32_t stepOffset = 0;  // cumulative step position
+
+    // --- Phase 0: Jerk up (raw per-step) ---
+    if (pb.jerk0Steps > 0) {
+        int32_t toWrite = pb.jerk0Steps;
+        if (cursor + toWrite > maxEntries) toWrite = maxEntries - cursor;
+        cursor += computeIntervalBlock(stepOffset, &lut[cursor], toWrite, tickFreq);
+        if (cursor >= maxEntries) return cursor;
+    }
+    stepOffset += pb.jerk0Steps;
+
+    // --- Phase 1: Constant accel (accel sentinel) ---
+    if (pb.constAccelSteps > 0) {
+        if (cursor + 7 > maxEntries) {
+            // Not enough space for sentinel; fall back to raw
+            int32_t toWrite = pb.constAccelSteps;
+            if (cursor + toWrite > maxEntries) toWrite = maxEntries - cursor;
+            cursor += computeIntervalBlock(stepOffset, &lut[cursor], toWrite, tickFreq);
+            return cursor;
+        }
+
+        // Accel sentinel: [1, v_hi, v_lo, a_hi, a_lo, count_hi, count_lo]
+        // V[1] is velocity at start of phase 1 (const accel)
+        // Acceleration per step = accelRate / velocity (chain rule: dv/ds = a/v)
+        // Use Q16.16 fixed-point for ISR computation
+        float v_start_phase = m_V[1];  // velocity at phase 1 start (steps/sec)
+        if (v_start_phase < MIN_VEL) v_start_phase = MIN_VEL;
+
+        // Pack initial velocity as Q16.16 (ticks: tickFreq / v)
+        // ISR works in velocity-space: v_fixed is in steps/sec * 65536
+        uint32_t v_fixed = (uint32_t)(v_start_phase * 65536.0f + 0.5f);
+
+        // Acceleration per step in Q16.16: a_per_step = accelRate / v * 65536
+        // But ISR does v += a_per_step each step, so a_per_step = accelRate * dt_avg * 65536
+        // More precisely: v_n+1 = v_n + a * (1/v_n), but that's not constant.
+        // Instead, ISR does: v_fixed += a_fixed (constant add per step).
+        // This gives v_end = v_start + N * a_fixed/65536
+        // We need: v_end = V[2] = V[1] + accelRate * T[1]
+        // And N = constAccelSteps
+        // So: a_fixed = (V[2] - V[1]) * 65536 / N
+        float v_end_phase = m_V[2];
+        float delta_v = v_end_phase - v_start_phase;
+        int32_t a_fixed = (int32_t)(delta_v * 65536.0f / (float)pb.constAccelSteps + 0.5f);
+
+        lut[cursor++] = 1;  // accel sentinel marker
+        lut[cursor++] = (uint16_t)(v_fixed >> 16);      // v_hi
+        lut[cursor++] = (uint16_t)(v_fixed & 0xFFFF);   // v_lo
+        lut[cursor++] = (uint16_t)((uint32_t)a_fixed >> 16);     // a_hi
+        lut[cursor++] = (uint16_t)((uint32_t)a_fixed & 0xFFFF);  // a_lo
+        lut[cursor++] = (uint16_t)(pb.constAccelSteps >> 16);    // count_hi
+        lut[cursor++] = (uint16_t)(pb.constAccelSteps & 0xFFFF); // count_lo
+    }
+    stepOffset += pb.constAccelSteps;
+
+    // --- Phase 2: Jerk down (raw per-step) ---
+    if (pb.jerk2Steps > 0) {
+        int32_t toWrite = pb.jerk2Steps;
+        if (cursor + toWrite > maxEntries) toWrite = maxEntries - cursor;
+        cursor += computeIntervalBlock(stepOffset, &lut[cursor], toWrite, tickFreq);
+        if (cursor >= maxEntries) return cursor;
+    }
+    stepOffset += pb.jerk2Steps;
+
+    // --- Phase 3: Cruise (cruise sentinel) ---
+    if (pb.cruiseSteps > 0) {
+        if (cursor + 4 > maxEntries) {
+            int32_t toWrite = pb.cruiseSteps;
+            if (cursor + toWrite > maxEntries) toWrite = maxEntries - cursor;
+            cursor += computeIntervalBlock(stepOffset, &lut[cursor], toWrite, tickFreq);
+            return cursor;
+        }
+
+        lut[cursor++] = 0;  // cruise sentinel marker
+
+        uint16_t cruiseInterval = 65535;
+        if (m_maxVel > 1.0f) {
+            float interval = (float)tickFreq / m_maxVel;
+            if (interval < 1.0f) interval = 1.0f;
+            if (interval > 65535.0f) interval = 65535.0f;
+            cruiseInterval = (uint16_t)(interval + 0.5f);
+        }
+        lut[cursor++] = cruiseInterval;
+        lut[cursor++] = (uint16_t)(pb.cruiseSteps >> 16);
+        lut[cursor++] = (uint16_t)(pb.cruiseSteps & 0xFFFF);
+    }
+    stepOffset += pb.cruiseSteps;
+
+    // --- Phase 4: Jerk down, decel start (raw per-step) ---
+    if (pb.jerk4Steps > 0) {
+        int32_t toWrite = pb.jerk4Steps;
+        if (cursor + toWrite > maxEntries) toWrite = maxEntries - cursor;
+        cursor += computeIntervalBlock(stepOffset, &lut[cursor], toWrite, tickFreq);
+        if (cursor >= maxEntries) return cursor;
+    }
+    stepOffset += pb.jerk4Steps;
+
+    // --- Phase 5: Constant decel (accel sentinel with negative acceleration) ---
+    if (pb.constDecelSteps > 0) {
+        if (cursor + 7 > maxEntries) {
+            int32_t toWrite = pb.constDecelSteps;
+            if (cursor + toWrite > maxEntries) toWrite = maxEntries - cursor;
+            cursor += computeIntervalBlock(stepOffset, &lut[cursor], toWrite, tickFreq);
+            return cursor;
+        }
+
+        float v_start_phase = m_V[5];  // velocity at phase 5 start
+        if (v_start_phase < MIN_VEL) v_start_phase = MIN_VEL;
+
+        uint32_t v_fixed = (uint32_t)(v_start_phase * 65536.0f + 0.5f);
+
+        // Deceleration: V[6] < V[5], so delta_v is negative → a_fixed is negative
+        float v_end_phase = m_V[6];
+        if (v_end_phase < MIN_VEL) v_end_phase = MIN_VEL;
+        float delta_v = v_end_phase - v_start_phase;
+        int32_t a_fixed = (int32_t)(delta_v * 65536.0f / (float)pb.constDecelSteps - 0.5f);
+
+        lut[cursor++] = 1;  // accel sentinel marker
+        lut[cursor++] = (uint16_t)(v_fixed >> 16);
+        lut[cursor++] = (uint16_t)(v_fixed & 0xFFFF);
+        lut[cursor++] = (uint16_t)((uint32_t)a_fixed >> 16);
+        lut[cursor++] = (uint16_t)((uint32_t)a_fixed & 0xFFFF);
+        lut[cursor++] = (uint16_t)(pb.constDecelSteps >> 16);
+        lut[cursor++] = (uint16_t)(pb.constDecelSteps & 0xFFFF);
+    }
+    stepOffset += pb.constDecelSteps;
+
+    // --- Phase 6: Jerk up, decel end (raw per-step) ---
+    if (pb.jerk6Steps > 0) {
+        int32_t toWrite = pb.jerk6Steps;
+        if (cursor + toWrite > maxEntries) toWrite = maxEntries - cursor;
+        cursor += computeIntervalBlock(stepOffset, &lut[cursor], toWrite, tickFreq);
+    }
+
+    return cursor;
+}
